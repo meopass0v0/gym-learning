@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+*.zip
+*.mp4
+*.gif
+*.png
+*.csv
+logs/
+venv/
+.venv/
+*.log
