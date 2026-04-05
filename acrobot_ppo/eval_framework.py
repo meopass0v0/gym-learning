@@ -47,7 +47,8 @@ class ActorCritic(nn.Module):
     def get_action(self, obs):
         logits, val = self.forward(obs)
         dist = Categorical(logits=logits)
-        return dist.sample(), dist.log_prob(dist.sample()), dist.entropy(), val.squeeze(-1)
+        action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), val.squeeze(-1)
 
     def get_action_and_logprob(self, obs, action):
         logits, val = self.forward(obs)
