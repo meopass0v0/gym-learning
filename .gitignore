@@ -7,7 +7,12 @@ __pycache__/
 *.png
 *.csv
 *.pt
+*.log
 logs/
 venv/
 .venv/
-*.log
+eval_summary*.json
+eval_data*.csv
+eval_results*.png
+ppo_honest*.png
+sample_*.mp4

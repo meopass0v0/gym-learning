@@ -285,7 +285,7 @@ def train_and_evaluate(env_id, seed, config, eval_every=5):
                   f"R={result['reward_mean']:7.1f}±{result['reward_se']:5.1f} | "
                   f"L={result['length_mean']:5.1f}±{result['length_std']:4.1f}")
 
-    return history
+    return history, model
 
 
 # ─────────────────────────────────────────────
@@ -561,9 +561,10 @@ if __name__ == "__main__":
     # Multi-seed training
     print(f"\n[Training {args.seeds} seeds...]")
     all_histories = []
+    last_model = None
     for seed in range(42, 42 + args.seeds):
         print(f"\n  --- Seed {seed} ---")
-        h = train_and_evaluate(config["env_id"], seed, config, eval_every=args.eval_every)
+        h, last_model = train_and_evaluate(config["env_id"], seed, config, eval_every=args.eval_every)
         all_histories.append(h)
 
     # Aggregate
@@ -584,7 +585,7 @@ if __name__ == "__main__":
 
     # Save model from last seed
     model_path = os.path.join(SAVE_DIR, f"ppo_final_{ts}.pt")
-    torch.save(model.state_dict(), model_path)
+    torch.save(last_model.state_dict(), model_path)
     print(f"\n[Saved] Model: {model_path}")
 
     # Save
@@ -593,7 +594,7 @@ if __name__ == "__main__":
 
     # Record episode videos
     eval_env = gym.make(config["env_id"], render_mode="rgb_array")
-    record_episode_videos(model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
+    record_episode_videos(last_model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
     eval_env.close()
 
     print("\n[DONE]")
