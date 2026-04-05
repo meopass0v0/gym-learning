@@ -108,8 +108,10 @@ def compute_returns_and_advantages(val_buf, rew_buf, done_buf, gamma, lam):
         advantages[t] = next_gae
         next_value = val_buf[t].item()
 
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-    returns = advantages + val_buf
+    # 标准化只给 actor 用，不污染 critic target
+    raw_advantages = advantages.clone()
+    advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-8)
+    returns = raw_advantages + val_buf  # 用未标准化的原始 advantage 给 critic
     return returns, advantages
 
 
