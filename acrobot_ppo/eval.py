@@ -25,9 +25,9 @@ def find_latest_model():
     return os.path.join(SAVE_DIR, models[-1])
 
 
-def eval_only(model_path, n_episodes=20):
+def eval_only(model_path, n_episodes=20, device="cuda"):
     """纯数值评估，不渲染窗口"""
-    model = PPO.load(model_path, device="cpu")
+    model = PPO.load(model_path, device=device)
     env = gym.make("Acrobot-v1", render_mode=None)
 
     rewards, lengths, successes = [], [], []
@@ -62,9 +62,9 @@ def eval_only(model_path, n_episodes=20):
     return sr, np.mean(rewards), np.mean(lengths)
 
 
-def eval_with_video(model_path, n_episodes=3):
+def eval_with_video(model_path, n_episodes=3, device="cuda"):
     """评估 + 生成 MP4"""
-    model = PPO.load(model_path, device="cpu")
+    model = PPO.load(model_path, device=device)
     env = gym.make("Acrobot-v1", render_mode="rgb_array")
 
     all_frames = []
@@ -100,7 +100,7 @@ def eval_with_video(model_path, n_episodes=3):
     imageio.mimwrite(mp4_path, all_frames, fps=30, codec="libx264", quality=8)
     print(f"[Saved] {mp4_path}")
 
-    return eval_only(model_path, n_episodes=10)
+    return eval_only(model_path, n_episodes=10, device=device)
 
 
 def main():
@@ -109,16 +109,18 @@ def main():
                         help="Generate MP4 video after eval")
     parser.add_argument("--episodes", type=int, default=20,
                         help="Number of evaluation episodes (default: 20)")
+    parser.add_argument("--device", default="cuda",
+                        help="Device for inference: cuda or cpu (default: cuda)")
     args = parser.parse_args()
 
     model_path = find_latest_model()
-    print(f"[Model] {model_path}")
+    print(f"[Model] {model_path} | device={args.device}")
 
     if args.video:
-        eval_with_video(model_path, n_episodes=3)
+        eval_with_video(model_path, n_episodes=3, device=args.device)
     else:
         print(f"\n[Eval] {args.episodes} episodes (no rendering)...")
-        eval_only(model_path, n_episodes=args.episodes)
+        eval_only(model_path, n_episodes=args.episodes, device=args.device)
 
 
 if __name__ == "__main__":

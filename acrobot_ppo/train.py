@@ -3,6 +3,7 @@ Acrobot PPO Demo - TLM
 Using PPO to solve Acrobot swing-up
 """
 
+import argparse
 import gymnasium as gym
 import numpy as np
 import matplotlib.pyplot as plt
@@ -170,6 +171,11 @@ def plot_learning_curves(df, save_dir):
 # Main
 # ─────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description="Acrobot PPO Trainer")
+    parser.add_argument("--device", default="cuda",
+                        help="Device: cuda or cpu (default: cuda)")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Acrobot PPO Demo - TLM")
     print("=" * 60)
@@ -180,7 +186,7 @@ def main():
     env = Monitor(env)
 
     print(f"[Env] Acrobot-v1 | Action: {env.action_space} | Obs: {env.observation_space.shape}")
-    print(f"[Train] {TOTAL_TIMESTEPS} timesteps...")
+    print(f"[Train] {TOTAL_TIMESTEPS} timesteps | device={args.device}")
 
     model = PPO(
         "MlpPolicy", env,
@@ -189,7 +195,7 @@ def main():
         gamma=0.99, gae_lambda=0.95, clip_range=0.2, ent_coef=0.01,
         verbose=1,
         tensorboard_log=os.path.join(SAVE_DIR, "logs"),
-        device="cpu"   # CPU for MlpPolicy
+        device=args.device
     )
 
     metrics_cb = MetricsCallback()
