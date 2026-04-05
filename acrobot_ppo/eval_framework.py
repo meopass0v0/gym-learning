@@ -22,6 +22,7 @@ from datetime import datetime
 import os
 import json
 import argparse
+import imageio
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAVE_DIR = r"C:\gym-learning\acrobot_ppo"
@@ -320,6 +321,75 @@ def aggregate_runs(all_histories, random_baseline):
     }
 
 
+
+
+# ─────────────────────────────────────────────
+# 9. Episode Video Recording
+# ─────────────────────────────────────────────
+def record_episode_videos(model, env, save_dir, n_success=1, n_failure=1):
+    """
+    Record episodes as MP4:
+    - n_success: first n_success successful episodes
+    - n_failure: first n_failure failed episodes
+    Records both success and failure cases for qualitative analysis.
+    """
+    model.eval()
+    success_frames, failure_frames = [], []
+    success_meta, failure_meta = [], []
+    max_frames = 1500
+
+    print("\n[Video] Recording episodes...")
+    ep_count = 0
+
+    for ep in range(n_success * 10 + n_failure * 10):
+        obs, _ = env.reset()
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
+        ep_frames = []
+        total_r, steps = 0, 0
+        done = truncated = False
+
+        while not (done or truncated):
+            frame = env.render()  # rgb_array
+            ep_frames.append(frame)
+            with torch.no_grad():
+                action, _, _, _ = model.get_action(obs_t)
+            obs, reward, done, truncated, _ = env.step(action.item())
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
+            total_r += reward
+            steps += 1
+
+        is_success = done and not truncated
+        meta = {"ep": ep + 1, "reward": total_r, "length": steps, "success": is_success}
+
+        if is_success and len(success_frames) < n_success:
+            trimmed = ep_frames[:max_frames:2]
+            success_frames.append(trimmed)
+            success_meta.append(meta)
+            print(f"  [SUCCESS] ep={ep+1} reward={total_r:.0f} length={steps}")
+        elif not is_success and len(failure_frames) < n_failure:
+            trimmed = ep_frames[:max_frames:2]
+            failure_frames.append(trimmed)
+            failure_meta.append(meta)
+            print(f"  [FAILURE] ep={ep+1} reward={total_r:.0f} length={steps}")
+
+        if len(success_frames) >= n_success and len(failure_frames) >= n_failure:
+            break
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for i, (frames, meta) in enumerate(zip(success_frames, success_meta)):
+        path = os.path.join(save_dir, f"video_success_{i+1}_{ts}.mp4")
+        print(f"  Encoding {len(frames)} frames -> {path}")
+        imageio.mimwrite(path, frames, fps=30, codec="libx264", quality=8)
+
+    for i, (frames, meta) in enumerate(zip(failure_frames, failure_meta)):
+        path = os.path.join(save_dir, f"video_failure_{i+1}_{ts}.mp4")
+        print(f"  Encoding {len(frames)} frames -> {path}")
+        imageio.mimwrite(path, frames, fps=30, codec="libx264", quality=8)
+
+    return success_meta, failure_meta
+
+
 # ─────────────────────────────────────────────
 # 8. 可视化
 # ─────────────────────────────────────────────
@@ -498,6 +568,7 @@ if __name__ == "__main__":
 
     # Aggregate
     agg = aggregate_runs(all_histories, random_bl)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("\n" + "=" * 70)
     print("FINAL RESULTS (Aggregate)")
@@ -511,8 +582,18 @@ if __name__ == "__main__":
     print(f"  Improvement SR:   +{(agg['sr_mean'] - agg['random_sr'])*100:.1f}% over random")
     print("=" * 70)
 
+    # Save model from last seed
+    model_path = os.path.join(SAVE_DIR, f"ppo_final_{ts}.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"\n[Saved] Model: {model_path}")
+
     # Save
     path, df = plot_results(agg, config, SAVE_DIR)
     save_csv(df, agg, config, SAVE_DIR)
+
+    # Record episode videos
+    eval_env = gym.make(config["env_id"], render_mode="rgb_array")
+    record_episode_videos(model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
+    eval_env.close()
 
     print("\n[DONE]")
