@@ -45,10 +45,13 @@ class ActorCritic(nn.Module):
         f = self.net(x)
         return self.actor(f), self.critic(f)
 
-    def get_action(self, obs):
+    def get_action(self, obs, deterministic=False):
         logits, val = self.forward(obs)
         dist = Categorical(logits=logits)
-        action = dist.sample()
+        if deterministic:
+            action = torch.argmax(logits, dim=-1)
+        else:
+            action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), val.squeeze(-1)
 
     def get_action_and_logprob(self, obs, action):
@@ -161,7 +164,7 @@ def evaluate_honest(env, model, n_episodes=50):
 
         while not (done or truncated):
             with torch.no_grad():
-                action, _, _, _ = model.get_action(obs_t)
+                action, _, _, _ = model.get_action(obs_t, deterministic=True)
             obs, reward, done, truncated, _ = env.step(action.item())
             obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
             total_r += reward
@@ -352,7 +355,7 @@ def record_episode_videos(model, env, save_dir, n_success=1, n_failure=1):
             frame = env.render()  # rgb_array
             ep_frames.append(frame)
             with torch.no_grad():
-                action, _, _, _ = model.get_action(obs_t)
+                action, _, _, _ = model.get_action(obs_t, deterministic=True)
             obs, reward, done, truncated, _ = env.step(action.item())
             obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
             total_r += reward
@@ -524,15 +527,15 @@ C = type('C', (), {
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seeds", type=int, default=5)
-    parser.add_argument("--steps", type=int, default=50000)
-    parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument("--seeds", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--eval-every", type=int, default=1)
     args = parser.parse_args()
 
     config = {
         "env_id": "Acrobot-v1",
         "total_steps": args.steps,
-        "n_steps": 4096,
+        "n_steps": 8192,
         "batch_size": 256,
         "n_epochs": 10,
         "lr": 3e-4,

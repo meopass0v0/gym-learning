@@ -46,10 +46,13 @@ class ActorCritic(nn.Module):
         features = self.net(x)
         return self.actor(features), self.critic(features)
 
-    def get_action(self, obs):
+    def get_action(self, obs, deterministic=False):
         action_logits, value = self.forward(obs)
         dist = Categorical(logits=action_logits)
-        action = dist.sample()
+        if deterministic:
+            action = torch.argmax(action_logits, dim=-1)
+        else:
+            action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), value.squeeze(-1)
 
     def get_action_and_logprob(self, obs, action):
