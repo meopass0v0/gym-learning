@@ -528,7 +528,7 @@ C = type('C', (), {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--steps", type=int, default=2000000)
     parser.add_argument("--eval-every", type=int, default=1)
     args = parser.parse_args()
 
