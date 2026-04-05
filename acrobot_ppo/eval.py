@@ -27,8 +27,8 @@ def find_latest_model():
 
 def eval_only(model_path, n_episodes=20):
     """纯数值评估，不渲染窗口"""
-    model = PPO.load(model_path)
-    env = gym.make("Acrobot-v1", render_mode=None)  # 无渲染
+    model = PPO.load(model_path, device="cpu")
+    env = gym.make("Acrobot-v1", render_mode=None)
 
     rewards, lengths, successes = [], [], []
 
@@ -48,7 +48,7 @@ def eval_only(model_path, n_episodes=20):
         lengths.append(steps)
         successes.append(total_reward > -100)
 
-        if ep < 5:  # 只打印前5个
+        if ep < 5:
             status = "OK" if successes[-1] else "FAIL"
             print(f"  Ep {ep+1:2d}: reward={total_reward:7.2f}, length={steps:4d} [{status}]")
 
@@ -64,7 +64,7 @@ def eval_only(model_path, n_episodes=20):
 
 def eval_with_video(model_path, n_episodes=3):
     """评估 + 生成 MP4"""
-    model = PPO.load(model_path)
+    model = PPO.load(model_path, device="cpu")
     env = gym.make("Acrobot-v1", render_mode="rgb_array")
 
     all_frames = []
@@ -92,7 +92,6 @@ def eval_with_video(model_path, n_episodes=3):
 
     env.close()
 
-    # 限制帧数
     if len(all_frames) > 1500:
         all_frames = all_frames[::2]
 
@@ -101,7 +100,6 @@ def eval_with_video(model_path, n_episodes=3):
     imageio.mimwrite(mp4_path, all_frames, fps=30, codec="libx264", quality=8)
     print(f"[Saved] {mp4_path}")
 
-    # 数值评估
     return eval_only(model_path, n_episodes=10)
 
 
