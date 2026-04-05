@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PPO Visualizer - Actor Critic</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117;
+    color: #e6edf3;
+    font-family: 'Segoe UI', sans-serif;
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  h1 {
+    text-align: center;
+    padding: 14px;
+    font-size: 18px;
+    color: #58a6ff;
+    border-bottom: 1px solid #21262d;
+    letter-spacing: 0.5px;
+  }
+  #controls {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    padding: 10px;
+    border-bottom: 1px solid #21262d;
+  }
+  button {
+    background: #238636;
+    color: #fff;
+    border: none;
+    padding: 8px 20px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  button:hover { background: #2ea043; }
+  button.active { background: #1f6feb; }
+  #canvas {
+    flex: 1;
+    display: block;
+  }
+  #log {
+    position: absolute;
+    bottom: 60px;
+    right: 20px;
+    width: 280px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px;
+    font-size: 12px;
+    line-height: 1.8;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  #log .entry { color: #8b949e; }
+  #log .entry.active { color: #f0883e; font-weight: bold; }
+  #log .label { color: #58a6ff; }
+  #log .value { color: #3fb950; }
+</style>
+</head>
+<body>
+<h1>PPO Architecture & Training Loop Visualizer</h1>
+<div id="controls">
+  <button id="btnReset" onclick="resetSim()">Reset</button>
+  <button id="btnStep" onclick="stepSim()" class="active">Step</button>
+  <button id="btnAuto" onclick="toggleAuto()">Auto Play</button>
+  <button id="btnRollout" onclick="playRollout()">Rollout</button>
+  <button id="btnGAE" onclick="playGAE()">GAE</button>
+  <button id="btnUpdate" onclick="playUpdate()">Update</button>
+</div>
+<canvas id="canvas"></canvas>
+<div id="log"></div>
+
+<script>
+// ─────────────────────────────────────────────
+// Canvas Setup
+// ─────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let W, H;
+
+function resize() {
+  W = canvas.width = canvas.offsetWidth;
+  H = canvas.height = canvas.offsetHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─────────────────────────────────────────────
+// Color Palette
+// ─────────────────────────────────────────────
+const C = {
+  bg: '#0d1117',
+  panel: '#161b22',
+  border: '#30363d',
+  text: '#e6edf3',
+  muted: '#8b949e',
+  blue: '#58a6ff',
+  green: '#3fb950',
+  orange: '#f0883e',
+  red: '#f85149',
+  purple: '#d2a8ff',
+  yellow: '#e3b341',
+  cyan: '#39d353',
+};
+
+// ─────────────────────────────────────────────
+// Network Definition
+// ─────────────────────────────────────────────
+// 6-dim obs -> shared (256) -> actor (3 actions) + critic (1 value)
+const LAYERS = [
+  { label: 'obs', n: 6, color: C.cyan },
+  { label: 'hidden', n: 8, color: C.purple },
+  { label: 'π(s)', n: 3, color: C.orange, sublabel: 'actor' },
+  { label: 'V(s)', n: 1, color: C.green, sublabel: 'critic' },
+];
+
+// ─────────────────────────────────────────────
+// Simulation State
+// ─────────────────────────────────────────────
+let state = {
+  phase: 'idle',   // idle, rollout, gae, update
+  stepCount: 0,
+  episodeCount: 0,
+  actorWeights: [],   // visual "weight" values for animation
+  gradients: [],      // gradient magnitudes for display
+  buffer: [],
+  advantages: [],
+  returns: [],
+  losses: [],
+  animProgress: 0,
+  autoRunning: false,
+  autoTimer: null,
+  epReward: 0,
+  epLength: 0,
+  currentAction: 0,
+  theta1: 0,
+  theta2: 0,
+  animatingNodes: new Set(),
+  gradientFlow: [],
+  logEntries: [],
+};
+
+// ─────────────────────────────────────────────
+// Utility
+// ─────────────────────────────────────────────
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function rand(lo, hi) { return lo + Math.random() * (hi - lo); }
+
+function log(msg, label, value) {
+  const entry = { msg, label, value, time: Date.now() };
+  state.logEntries.unshift(entry);
+  if (state.logEntries.length > 30) state.logEntries.pop();
+  renderLog();
+}
+
+function renderLog() {
+  const el = document.getElementById('log');
+  el.innerHTML = state.logEntries.slice(0, 15).map(e => {
+    const label = e.label ? `<span class="label">${e.label}</span>` : '';
+    const value = e.value !== undefined ? `<span class="value">${e.value}</span>` : '';
+    return `<div class="entry">${label}${value ? ': ' + value : ''} <span style="color:#484f58">${e.msg}</span></div>`;
+  }).join('');
+}
+
+// ─────────────────────────────────────────────
+// Node Positions
+// ─────────────────────────────────────────────
+function getLayerX(i, panelX, panelW) {
+  return panelX + (i + 0.5) / LAYERS.length * panelW;
+}
+function getNodeXY(layerIdx, nodeIdx, panelX, panelW, panelH) {
+  const x = getLayerX(layerIdx, panelX, panelW);
+  const n = LAYERS[layerIdx].n;
+  const totalH = (n - 1) * 28;
+  const y0 = H / 2 - totalH / 2;
+  return { x, y: y0 + nodeIdx * 28 };
+}
+
+// ─────────────────────────────────────────────
+// Drawing
+// ─────────────────────────────────────────────
+function drawPanel(x, y, w, h, title) {
+  ctx.fillStyle = C.panel;
+  ctx.strokeStyle = C.border;
+  ctx.lineWidth = 1;
+  roundRect(ctx, x, y, w, h, 8);
+  ctx.fill();
+  ctx.stroke();
+  if (title) {
+    ctx.fillStyle = C.muted;
+    ctx.font = '11px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText(title, x + w / 2, y + 18);
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawNetwork(panelX, panelY, panelW, panelH, highlightLayer) {
+  // Draw connections
+  for (let l = 0; l < LAYERS.length - 1; l++) {
+    for (let n1 = 0; n1 < LAYERS[l].n; n1++) {
+      for (let n2 = 0; n2 < LAYERS[l+1].n; n2++) {
+        const p1 = getNodeXY(l, n1, panelX, panelW, panelH);
+        const p2 = getNodeXY(l+1, n2, panelX, panelW, panelH);
+        const glow = state.animatingNodes.has(`${l}-${n1}`);
+        ctx.strokeStyle = glow ? C.blue : C.border;
+        ctx.lineWidth = glow ? 1.5 : 0.5;
+        ctx.globalAlpha = glow ? 0.9 : 0.4;
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  // Draw nodes
+  for (let l = 0; l < LAYERS.length; l++) {
+    for (let n = 0; n < LAYERS[l].n; n++) {
+      const { x, y } = getNodeXY(l, n, panelX, panelW, panelH);
+      const glow = state.animatingNodes.has(`${l}-${n}`);
+      const isHighlighted = l === highlightLayer;
+
+      ctx.beginPath();
+      ctx.arc(x, y, isHighlighted ? 9 : 7, 0, Math.PI * 2);
+      ctx.fillStyle = glow ? C.blue : (isHighlighted ? LAYERS[l].color : '#21262d');
+      ctx.fill();
+      ctx.strokeStyle = glow ? C.blue : LAYERS[l].color;
+      ctx.lineWidth = glow ? 2 : 1;
+      ctx.stroke();
+
+      // Label
+      if (l === 0) {
+        const labels = ['cosθ1', 'sinθ1', 'cosθ2', 'sinθ2', 'ω1', 'ω2'];
+        ctx.fillStyle = C.muted;
+        ctx.font = '9px Segoe UI';
+        ctx.textAlign = 'right';
+        ctx.fillText(labels[n], x - 12, y + 3);
+      }
+      if (l === 2) {
+        const labels = ['←1', '0', '+1→'];
+        ctx.fillStyle = C.orange;
+        ctx.font = '9px Segoe UI';
+        ctx.textAlign = 'center';
+        ctx.fillText(labels[n], x, y + 3);
+      }
+      if (l === 3) {
+        ctx.fillStyle = C.green;
+        ctx.font = '9px Segoe UI';
+        ctx.textAlign = 'left';
+        ctx.fillText('V', x + 12, y + 3);
+      }
+    }
+  }
+
+  // Layer labels
+  const layerLabels = ['State s', 'Shared MLP', 'Actor π', 'Critic V'];
+  for (let l = 0; l < LAYERS.length; l++) {
+    const x = getLayerX(l, panelX, panelW);
+    ctx.fillStyle = LAYERS[l].color;
+    ctx.font = '11px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText(layerLabels[l], x, panelY + panelH + 22);
+  }
+}
+
+function drawAcrobot(cx, cy, scale, time) {
+  const r1 = 60 * scale, r2 = 60 * scale;
+  const alpha = state.theta1 + Math.sin(time * 0.002) * 0.1;
+  const beta = state.theta2 + Math.sin(time * 0.003) * 0.15;
+
+  const x1 = cx, y1 = cy;
+  const x2 = cx + r1 * Math.sin(alpha);
+  const y2 = cy - r1 * Math.cos(alpha);
+  const x3 = x2 + r2 * Math.sin(alpha + beta);
+  const y3 = y2 - r2 * Math.cos(alpha + beta);
+
+  // Ground line
+  ctx.strokeStyle = C.border;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(cx - 80, cy);
+  ctx.lineTo(cx + 80, cy);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Link 1
+  ctx.strokeStyle = C.blue;
+  ctx.lineWidth = 6;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+
+  // Link 2
+  ctx.strokeStyle = C.cyan;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x3, y3);
+  ctx.stroke();
+
+  // Joints
+  ctx.fillStyle = C.yellow;
+  ctx.beginPath();
+  ctx.arc(x1, y1, 8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = C.orange;
+  ctx.beginPath();
+  ctx.arc(x2, y2, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // End effector target
+  const targetY = cy - 100 * scale;
+  const goalMet = -Math.cos(state.theta1) - Math.cos(state.theta2 + state.theta1) > 1.0;
+  ctx.strokeStyle = goalMet ? C.green : C.red;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(cx - 80, targetY);
+  ctx.lineTo(cx + 80, targetY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // End effector
+  ctx.fillStyle = goalMet ? C.green : C.red;
+  ctx.beginPath();
+  ctx.arc(x3, y3, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Labels
+  ctx.fillStyle = C.muted;
+  ctx.font = '11px Segoe UI';
+  ctx.textAlign = 'center';
+  ctx.fillText('θ1', (x1 + x2) / 2 - 10, (y1 + y2) / 2);
+  ctx.fillText('θ2', (x2 + x3) / 2 + 10, (y2 + y3) / 2);
+
+  // Info
+  ctx.fillStyle = C.muted;
+  ctx.font = '10px Segoe UI';
+  ctx.textAlign = 'left';
+  ctx.fillText(`Reward: ${state.epReward.toFixed(1)}`, cx - 80, cy + 30);
+  ctx.fillText(`Steps: ${state.epLength}`, cx - 80, cy + 45);
+  ctx.fillText(`Goal: ${goalMet ? 'REACHED' : 'not reached'}`, cx - 80, cy + 60);
+}
+
+function drawBufferPanel(x, y, w, h) {
+  drawPanel(x, y, w, h, 'Rollout Buffer');
+  const entries = state.buffer.slice(-20);
+  const entryH = 18;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const ey = y + 30 + i * entryH;
+    ctx.fillStyle = e.done ? C.red + '44' : C.green + '22';
+    ctx.fillRect(x + 6, ey, w - 12, entryH - 2);
+    ctx.fillStyle = C.muted;
+    ctx.font = '9px Consolas';
+    ctx.textAlign = 'left';
+    ctx.fillText(
+      `a=${e.action} r=${e.reward.toFixed(0)} V=${e.value.toFixed(2)}`,
+      x + 10, ey + 12
+    );
+    if (e.done) {
+      ctx.fillStyle = C.red;
+      ctx.fillText('DONE', x + w - 50, ey + 12);
+    }
+  }
+  if (entries.length === 0) {
+    ctx.fillStyle = C.muted;
+    ctx.font = '11px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText('(empty)', x + w / 2, y + h / 2);
+  }
+}
+
+function drawGAEPanel(x, y, w, h) {
+  drawPanel(x, y, w, h, 'Advantage & Return');
+  const bw = (w - 20) / state.advantages.length;
+  for (let i = 0; i < state.advantages.length; i++) {
+    const adv = state.advantages[i] || 0;
+    const ret = state.returns[i] || 0;
+    const ax = x + 10 + i * bw;
+    const baseY = y + h / 2;
+    const maxH = 60;
+
+    const advH = clamp(adv * maxH, -maxH, maxH);
+    ctx.fillStyle = adv >= 0 ? C.green + 'aa' : C.red + 'aa';
+    ctx.fillRect(ax, baseY - advH, bw - 1, Math.abs(advH));
+
+    ctx.fillStyle = C.blue + '55';
+    ctx.fillRect(ax, baseY - clamp(ret * maxH, -maxH, maxH), bw - 1, 2);
+  }
+
+  ctx.fillStyle = C.muted;
+  ctx.font = '9px Segoe UI';
+  ctx.textAlign = 'center';
+  ctx.fillText('green=Adv  blue=Ret', x + w / 2, y + h - 10);
+}
+
+function drawLossPanel(x, y, w, h) {
+  drawPanel(x, y, w, h, 'Loss');
+  const losses = state.losses.slice(-30);
+  if (losses.length < 2) return;
+  const maxL = Math.max(...losses.map(Math.abs), 1);
+  const bw = (w - 20) / 30;
+  for (let i = 0; i < losses.length; i++) {
+    const lx = x + 10 + i * bw;
+    const lh = clamp((losses[i] / maxL) * 40, -40, 40);
+    const baseY = y + h / 2;
+    ctx.fillStyle = C.orange;
+    ctx.fillRect(lx, baseY - lh, bw - 1, Math.abs(lh));
+  }
+}
+
+function drawMetricsPanel(x, y, w, h) {
+  drawPanel(x, y, w, h, 'Metrics');
+  const items = [
+    ['Step', state.stepCount],
+    ['Episode', state.episodeCount],
+    ['Phase', state.phase.toUpperCase()],
+    ['Actor Loss', state.losses.length ? state.losses[state.losses.length-1].toFixed(4) : '-'],
+    ['Avg Adv', state.advantages.length ? (state.advantages.reduce((a,b)=>a+b,0)/state.advantages.length).toFixed(3) : '-'],
+  ];
+  items.forEach(([k, v], i) => {
+    ctx.fillStyle = C.muted;
+    ctx.font = '11px Segoe UI';
+    ctx.textAlign = 'left';
+    ctx.fillText(k + ':', x + 15, y + 35 + i * 22);
+    ctx.fillStyle = C.blue;
+    ctx.textAlign = 'right';
+    ctx.fillText(v, x + w - 15, y + 35 + i * 22);
+  });
+}
+
+function drawArrow(x1, y1, x2, y2, color, label, animated) {
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+  const len = Math.hypot(x2 - x1, y2 - y1);
+  const headLen = 10;
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = animated ? 3 : 2;
+  ctx.globalAlpha = animated ? 0.8 : 0.6;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2 - headLen * Math.cos(angle), y2 - headLen * Math.sin(angle));
+  ctx.stroke();
+
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - headLen * Math.cos(angle - Math.PI / 6), y2 - headLen * Math.sin(angle - Math.PI / 6));
+  ctx.lineTo(x2 - headLen * Math.cos(angle + Math.PI / 6), y2 - headLen * Math.sin(angle + Math.PI / 6));
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  if (label) {
+    ctx.fillStyle = color;
+    ctx.font = '11px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, (x1 + x2) / 2, (y1 + y2) / 2 - 8);
+  }
+}
+
+// ─────────────────────────────────────────────
+// Animation helpers
+// ─────────────────────────────────────────────
+function animateNodes(layerIdx, duration, delay = 0) {
+  const n = LAYERS[layerIdx].n;
+  setTimeout(() => {
+    for (let i = 0; i < n; i++) {
+      setTimeout(() => {
+        state.animatingNodes.add(`${layerIdx}-${i}`);
+        setTimeout(() => state.animatingNodes.delete(`${layerIdx}-${i}`), duration);
+      }, i * 60);
+    }
+  }, delay);
+}
+
+function pulseNode(layerIdx, nodeIdx, duration) {
+  state.animatingNodes.add(`${layerIdx}-${nodeIdx}`);
+  setTimeout(() => state.animatingNodes.delete(`${layerIdx}-${nodeIdx}`), duration);
+}
+
+// ─────────────────────────────────────────────
+// Simulation Actions
+// ─────────────────────────────────────────────
+function simulateAction() {
+  // Pick action (softmax-like from actor)
+  const action = Math.floor(Math.random() * 3); // 0,1,2
+  const reward = action === 1 ? -1 : (Math.random() > 0.7 ? 0 : -1); // mostly -1
+  const done = Math.random() > 0.98;
+  const value = rand(-2, 2);
+
+  return { action, reward, done, value };
+}
+
+function addBufferEntry() {
+  const { action, reward, done, value } = simulateAction();
+  state.epReward += reward;
+  state.epLength++;
+
+  // Update theta
+  state.theta1 = clamp(state.theta1 + rand(-0.2, 0.2), -Math.PI, Math.PI);
+  state.theta2 = clamp(state.theta2 + rand(-0.3, 0.3), -Math.PI, Math.PI);
+
+  state.buffer.push({ action, reward, done, value: value + state.epReward * 0.01 });
+
+  if (done) {
+    state.episodeCount++;
+    state.epReward = 0;
+    state.epLength = 0;
+    log(`Episode ${state.episodeCount} done`, 'DONE', '');
+  }
+}
+
+// ─────────────────────────────────────────────
+// Phases
+// ─────────────────────────────────────────────
+function doRollout() {
+  const steps = 20;
+  let i = 0;
+  const interval = setInterval(() => {
+    addBufferEntry();
+    animateNodes(0, 300); // state
+    animateNodes(2, 400, 50); // action
+    state.stepCount++;
+    log(`Step ${state.stepCount}`, 'Rollout', `a=${state.buffer[state.buffer.length-1].action}`);
+    render();
+    i++;
+    if (i >= steps) {
+      clearInterval(interval);
+      state.phase = 'idle';
+      log(`${steps} steps collected`, 'Buffer', `${state.buffer.length} entries`);
+    }
+  }, 80);
+}
+
+function doGAE() {
+  if (state.buffer.length === 0) { log('Buffer empty, run Rollout first', 'ERROR', ''); return; }
+  state.phase = 'gae';
+  state.advantages = state.buffer.map((_, i) => rand(-1, 1));
+  state.returns = state.advantages.map((a, i) => a + state.buffer[i].value);
+
+  let i = 0;
+  const interval = setInterval(() => {
+    animateNodes(3, 200); // critic for advantage
+    log(`GAE t=${i}`, 'Adv', state.advantages[i].toFixed(3));
+    i++;
+    render();
+    if (i >= state.advantages.length) {
+      clearInterval(interval);
+      state.phase = 'idle';
+      const avgAdv = (state.advantages.reduce((a, b) => a + b, 0) / state.advantages.length).toFixed(3);
+      log(`GAE done, avg Adv=${avgAdv}`, 'GAE', '');
+    }
+  }, 60);
+}
+
+function doUpdate() {
+  if (state.buffer.length === 0) { log('Buffer empty, run Rollout first', 'ERROR', ''); return; }
+  state.phase = 'update';
+  const nEpochs = 3;
+  let epoch = 0, mb = 0;
+
+  function nextMB() {
+    const loss = rand(0.1, 2.0);
+    state.losses.push(loss);
+    animateNodes(0, 200);
+    animateNodes(1, 300, 50);
+    animateNodes(2, 300, 100); // actor update
+    animateNodes(3, 300, 150); // critic update
+    state.stepCount++;
+    log(`epoch=${epoch} mb=${mb} loss=${loss.toFixed(4)}`, 'Update', `π + V update`);
+    render();
+    mb++;
+    if (mb >= 4) { mb = 0; epoch++; }
+    if (epoch >= nEpochs) {
+      state.phase = 'idle';
+      log(`PPO update done (${nEpochs} epochs)`, 'Update', 'Complete');
+      return;
+    }
+    setTimeout(nextMB, 200);
+  }
+  nextMB();
+}
+
+// ─────────────────────────────────────────────
+// Main Render
+// ─────────────────────────────────────────────
+function render() {
+  ctx.clearRect(0, 0, W, H);
+
+  // ── Acrobot Environment ──
+  const acrobotX = 130, acrobotY = H / 2 - 30;
+  const acrobotW = 240, acrobotH = 180;
+  drawPanel(10, H / 2 - acrobotH / 2 - 20, acrobotW, acrobotH + 60, 'Environment: Acrobot');
+  drawAcrobot(acrobotX, acrobotY, 0.95, Date.now());
+
+  // ── Network ──
+  const netX = acrobotW + 20;
+  const netY = 20;
+  const netW = W - netX - 320;
+  const netH = H - 100;
+  drawPanel(netX, netY, netW, netH, 'Actor-Critic Network');
+  drawNetwork(netX, netY, netW, netH - 30, -1);
+
+  // Phase label on network
+  if (state.phase !== 'idle') {
+    ctx.fillStyle = C.yellow;
+    ctx.font = 'bold 13px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText(state.phase === 'update' ? 'UPDATING...' : state.phase.toUpperCase(), netX + netW / 2, netY + netH - 10);
+  }
+
+  // ── Right panels ──
+  const rightX = W - 300;
+  const panelW = 280;
+
+  // Buffer
+  drawBufferPanel(rightX, 10, panelW, 200);
+
+  // GAE
+  drawGAEPanel(rightX, 220, panelW, 130);
+
+  // Loss
+  drawLossPanel(rightX, 360, panelW, 100);
+
+  // Metrics
+  drawMetricsPanel(rightX, 470, panelW, 160);
+
+  // ── Phase arrows / annotations ──
+  // Arrow: env -> network
+  drawArrow(acrobotX + 80, acrobotY - 20, netX + 30, netY + 80, C.cyan, 's_t');
+  // Arrow: network -> env
+  drawArrow(netX + 30, netY + netH / 2, acrobotX + 80, acrobotY + 40, C.orange, 'a_t');
+
+  // ── Legend / Annotation box ──
+  const annotX = netX + 20;
+  const annotY = netY + 40;
+  ctx.fillStyle = C.panel;
+  ctx.strokeStyle = C.border;
+  roundRect(ctx, annotX, annotY, netW - 40, 80, 6);
+  ctx.fill(); ctx.stroke();
+
+  const annotLines = [
+    [C.cyan, 'State s', '→ 6 observation features (angles, velocities)'],
+    [C.orange, 'Actor π', '→ policy: outputs action probabilities'],
+    [C.green, 'Critic V', '→ value: estimates future return'],
+    [C.purple, 'MLP', '→ shared backbone (256 units)'],
+  ];
+  annotLines.forEach(([color, title, desc], i) => {
+    ctx.fillStyle = color;
+    ctx.font = 'bold 11px Segoe UI';
+    ctx.textAlign = 'left';
+    ctx.fillText(title, annotX + 10, annotY + 18 + i * 18);
+    ctx.fillStyle = C.muted;
+    ctx.font = '11px Segoe UI';
+    ctx.fillText(desc, annotX + 80, annotY + 18 + i * 18);
+  });
+
+  // ── Loop arrows at bottom ──
+  const loopY = H - 55;
+  ctx.fillStyle = C.panel;
+  roundRect(ctx, netX, loopY - 20, netW, 50, 6);
+  ctx.fill(); ctx.stroke();
+
+  const phases = ['Rollout', 'GAE', 'PPO Update'];
+  const phaseColors = [C.blue, C.purple, C.orange];
+  phases.forEach((p, i) => {
+    const px = netX + (i + 0.5) / 3 * netW;
+    ctx.fillStyle = phaseColors[i];
+    ctx.beginPath();
+    ctx.arc(px, loopY, 14, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.font = 'bold 10px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText(i + 1, px, loopY + 4);
+    ctx.fillStyle = phaseColors[i];
+    ctx.font = '11px Segoe UI';
+    ctx.fillText(p, px, loopY + 28);
+    if (i < 2) {
+      ctx.strokeStyle = C.muted;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(px + 20, loopY);
+      ctx.lineTo(px + netW / 3 - 20, loopY);
+      ctx.stroke();
+    }
+  });
+}
+
+// ─────────────────────────────────────────────
+// Animation Loop
+// ─────────────────────────────────────────────
+let lastTime = 0;
+function loop(time) {
+  requestAnimationFrame(loop);
+  // Subtle animation of acrobot even when idle
+  if (state.phase === 'idle') {
+    state.theta1 += Math.sin(time * 0.001) * 0.002;
+    state.theta2 += Math.cos(time * 0.0015) * 0.003;
+  }
+  render();
+  lastTime = time;
+}
+requestAnimationFrame(loop);
+
+// ─────────────────────────────────────────────
+// Controls
+// ─────────────────────────────────────────────
+function resetSim() {
+  state.phase = 'idle';
+  state.stepCount = 0;
+  state.episodeCount = 0;
+  state.buffer = [];
+  state.advantages = [];
+  state.returns = [];
+  state.losses = [];
+  state.epReward = 0;
+  state.epLength = 0;
+  state.animatingNodes.clear();
+  state.logEntries = [];
+  log('Reset', 'System', '');
+}
+
+function stepSim() {
+  addBufferEntry();
+  state.stepCount++;
+  animateNodes(0, 200);
+  animateNodes(2, 300, 80);
+  log(`Step ${state.stepCount}`, 'Step', `a=${state.buffer[state.buffer.length-1].action}`);
+  render();
+}
+
+function toggleAuto() {
+  state.autoRunning = !state.autoRunning;
+  document.getElementById('btnAuto').textContent = state.autoRunning ? 'Stop Auto' : 'Auto Play';
+  if (state.autoRunning) {
+    state.autoTimer = setInterval(stepSim, 300);
+  } else {
+    clearInterval(state.autoTimer);
+  }
+}
+
+function playRollout() {
+  if (state.autoRunning) { toggleAuto(); }
+  state.phase = 'rollout';
+  doRollout();
+}
+
+function playGAE() {
+  if (state.autoRunning) { toggleAuto(); }
+  doGAE();
+}
+
+function playUpdate() {
+  if (state.autoRunning) { toggleAuto(); }
+  doUpdate();
+}
+
+// Expose to buttons
+window.resetSim = resetSim;
+window.stepSim = stepSim;
+window.toggleAuto = toggleAuto;
+window.playRollout = playRollout;
+window.playGAE = playGAE;
+window.playUpdate = playUpdate;
+
+log('Ready. Try: Rollout → GAE → Update', 'System', '');
+</script>
+</body>
+</html>
