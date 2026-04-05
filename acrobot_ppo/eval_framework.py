@@ -177,12 +177,13 @@ def evaluate_honest(env, model, n_episodes=50):
         "lengths": lengths,
         "success": success_flags,
         "sr": success_flags.mean(),
-        "sr_std": success_flags.std() / np.sqrt(len(success_flags)),  # SE
+        "sr_se": success_flags.std() / np.sqrt(len(success_flags)),
         "reward_mean": rewards.mean(),
         "reward_std": rewards.std(),
         "reward_se": rewards.std() / np.sqrt(len(rewards)),
         "length_mean": lengths.mean(),
         "length_std": lengths.std(),
+        "length_se": lengths.std() / np.sqrt(len(lengths)),
     }
 
 
@@ -429,6 +430,7 @@ def save_csv(df, agg, config, save_dir):
             "reward_std": float(agg["reward_mean_std"]),
             "length_mean": float(agg["length_mean_mean"]),
             "length_std": float(agg["length_mean_std"]),
+        "length_se": float(agg["length_mean_std"]) / np.sqrt(agg["n_seeds"]),
         },
         "n_seeds": agg["n_seeds"],
         "timestamp": ts_str,
