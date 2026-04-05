@@ -216,6 +216,51 @@ def evaluate_random(env, n_episodes=200):
     }
 
 
+
+# ─────────────────────────────────────────────
+# Reward Shaping Wrapper
+# ─────────────────────────────────────────────
+class RewardShapingWrapper(gym.Wrapper):
+    """
+    Reward shaping with two terms:
+      height_shaping  = k_h * (cos(theta1) + cos(theta1 + theta2))
+        - 越接近"摆起来" reward 越大，∈ [-2k_h, +2k_h]
+      velocity_shaping = k_v * omega1
+        - 鼓励有效摆动，omega1 ∈ ~[-12, +12] rad/s
+    """
+
+    def __init__(self, env, k_h=0.0, k_v=0.0):
+        super().__init__(env)
+        self.k_h = k_h
+        self.k_v = k_v
+
+    def step(self, action):
+        obs, base_reward, done, truncated, info = self.env.step(action)
+
+        # obs = [cos(theta1), sin(theta1), cos(theta2), sin(theta2), omega1, omega2]
+        cos_t1, sin_t1 = obs[0], obs[1]
+        cos_t2, sin_t2 = obs[2], obs[3]
+        omega1 = obs[4]
+
+        theta1 = np.arctan2(sin_t1, cos_t1)
+        theta2 = np.arctan2(sin_t2, cos_t2)
+
+        # height shaping: k_h * (cos(theta1) + cos(theta1 + theta2))
+        height_shaping = self.k_h * (cos_t1 + np.cos(theta1 + theta2))
+
+        # velocity shaping: k_v * omega1
+        velocity_shaping = self.k_v * omega1
+
+        # 到达目标保持 0 reward
+        if done and not truncated:
+            shaped_reward = 0.0
+        else:
+            shaped_reward = base_reward + height_shaping + velocity_shaping
+
+        return obs, shaped_reward, done, truncated, info
+
+
+
 # ─────────────────────────────────────────────
 # 6. 完整训练 + 记录
 # ─────────────────────────────────────────────
@@ -228,6 +273,10 @@ def train_and_evaluate(env_id, seed, config, eval_every=5):
     np.random.seed(seed)
     env = gym.make(env_id)
     env.reset(seed=seed)
+    k_h = config.get("k_h", 0.0)
+    k_v = config.get("k_v", 0.0)
+    if k_h > 0 or k_v > 0:
+        env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
 
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
