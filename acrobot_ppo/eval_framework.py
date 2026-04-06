@@ -536,6 +536,7 @@ def get_latest_checkpoint(save_dir):
     """
     查找 save_dir 下最新的 ppo_final_*.pt 文件。
     返回 (checkpoint_path, config_path) 或 (None, None)。
+    config_path 可能不存在（旧格式 checkpoint）。
     """
     pattern = os.path.join(save_dir, "ppo_final_*.pt")
     files = glob.glob(pattern)
@@ -544,7 +545,7 @@ def get_latest_checkpoint(save_dir):
 
     latest_pt = max(files, key=os.path.getmtime)
     basename = os.path.basename(latest_pt)
-    # e.g. ppo_final_20260406_123045.pt → ts_part = 20260406_123045
+    # e.g. ppo_final_20260406_202508.pt → ts_part = 20260406_202508
     ts_part = os.path.splitext(basename)[0].replace("ppo_final_", "")
     config_path = os.path.join(save_dir, f"config_{ts_part}.json")
     return latest_pt, config_path
@@ -571,33 +572,83 @@ def save_checkpoint(model, optimizer, config, save_dir, current_update):
     return model_path, config_path
 
 
-def load_checkpoint(checkpoint_path, config_path, device=DEVICE):
+def load_checkpoint(checkpoint_path, config_path, device=DEVICE, default_config=None):
     """
-    加载 checkpoint（包含 model + optimizer + current_update）和对应 config。
+    加载 checkpoint。
+
+    支持两种格式：
+    1. 新格式（含 model_state, optimizer_state, current_update）+ config JSON
+    2. 旧格式（仅 state_dict），无 config 文件
+
     返回 (model, optimizer, config, current_update)
     """
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
     ckpt = torch.load(checkpoint_path, map_location=device)
 
-    env = gym.make(config["env_id"])
-    k_h = config.get("k_h", 0.0)
-    k_v = config.get("k_v", 0.0)
-    if k_h > 0 or k_v > 0:
-        env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.n
-    env.close()
+    # 检测是新格式还是旧格式
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
+        # 新格式：有 model_state 键
+        if config_path and os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+        else:
+            print(f"[WARN] config file not found: {config_path}, using default_config")
+            config = dict(default_config) if default_config else get_default_config()
 
-    model = ActorCritic(obs_dim, act_dim, hidden=config.get("hidden", 256)).to(device)
-    model.load_state_dict(ckpt["model_state"])
+        env = gym.make(config["env_id"])
+        k_h = config.get("k_h", 0.0)
+        k_v = config.get("k_v", 0.0)
+        if k_h > 0 or k_v > 0:
+            env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
+        obs_dim = env.observation_space.shape[0]
+        act_dim = env.action_space.n
+        env.close()
 
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
-    optimizer.load_state_dict(ckpt["optimizer_state"])
+        model = ActorCritic(obs_dim, act_dim, hidden=config.get("hidden", 256)).to(device)
+        model.load_state_dict(ckpt["model_state"])
 
-    current_update = ckpt.get("current_update", 1)
+        optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+
+        current_update = ckpt.get("current_update", 1)
+    else:
+        # 旧格式：直接是 state_dict
+        print(f"[WARN] Old checkpoint format (raw state_dict), using default config")
+        config = dict(default_config) if default_config else get_default_config()
+
+        env = gym.make(config["env_id"])
+        k_h = config.get("k_h", 0.0)
+        k_v = config.get("k_v", 0.0)
+        if k_h > 0 or k_v > 0:
+            env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
+        obs_dim = env.observation_space.shape[0]
+        act_dim = env.action_space.n
+        env.close()
+
+        model = ActorCritic(obs_dim, act_dim, hidden=config.get("hidden", 256)).to(device)
+        model.load_state_dict(ckpt)
+
+        optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+        current_update = 1
+
     return model, optimizer, config, current_update
+
+
+def get_default_config():
+    return {
+        "env_id": "Acrobot-v1",
+        "total_steps": 2000000,
+        "n_steps": 8192,
+        "batch_size": 256,
+        "n_epochs": 10,
+        "lr": 3e-4,
+        "gamma": 0.99,
+        "lam": 0.95,
+        "clip_range": 0.2,
+        "value_coef": 0.5,
+        "ent_coef": 0.01,
+        "hidden": 256,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -650,13 +701,14 @@ if __name__ == "__main__":
         else:
             ckpt_path, config_path = get_latest_checkpoint(SAVE_DIR)
 
-        if ckpt_path is None or config_path is None:
+        if ckpt_path is None:
             print(f"[ERROR] 找不到 checkpoint，save_dir={SAVE_DIR}")
             exit(1)
 
         print(f"[Load] Checkpoint: {ckpt_path}")
-        print(f"[Load] Config:     {config_path}")
-        model, optimizer, config, current_update = load_checkpoint(ckpt_path, config_path)
+        print(f"[Load] Config:     {config_path if os.path.exists(config_path) else '(none - old format)'}")
+        model, optimizer, config, current_update = load_checkpoint(
+            ckpt_path, config_path, default_config=config)
 
         print(f"[Info] current_update={current_update}, total_steps={config['total_steps']}")
 
