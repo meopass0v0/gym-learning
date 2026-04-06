@@ -23,6 +23,7 @@ import os
 import json
 import argparse
 import imageio
+import glob
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAVE_DIR = r"C:\gym-learning\acrobot_ppo"
@@ -264,9 +265,13 @@ class RewardShapingWrapper(gym.Wrapper):
 # ─────────────────────────────────────────────
 # 6. 完整训练 + 记录
 # ─────────────────────────────────────────────
-def train_and_evaluate(env_id, seed, config, eval_every=5):
+def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
+                       loaded_model=None, loaded_optimizer=None):
     """
-    单次训练 run，返回完整指标历史
+    单次训练 run，返回完整指标历史。
+
+    start_update: 从哪个 update 开始继续训练（用于断点续训）
+    loaded_model / loaded_optimizer: 如果从 checkpoint 加载，则传入
     """
     # 设置随机种子
     torch.manual_seed(seed)
@@ -281,8 +286,15 @@ def train_and_evaluate(env_id, seed, config, eval_every=5):
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
 
-    model = ActorCritic(obs_dim, act_dim, hidden=config.get("hidden", 256)).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    if loaded_model is not None:
+        model = loaded_model
+    else:
+        model = ActorCritic(obs_dim, act_dim, hidden=config.get("hidden", 256)).to(DEVICE)
+
+    if loaded_optimizer is not None:
+        optimizer = loaded_optimizer
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=config["lr"])
 
     n_steps = config["n_steps"]
     total_updates = config["total_steps"] // n_steps
@@ -296,7 +308,7 @@ def train_and_evaluate(env_id, seed, config, eval_every=5):
         "policy_loss": [], "value_loss": [], "entropy": [],
     }
 
-    for it in range(1, total_updates + 1):
+    for it in range(start_update, total_updates + 1):
         obs_b, act_b, rew_b, done_b, logp_b, val_b, ent_b = collect_rollout(env, model, n_steps)
         returns_b, advantages_b = compute_returns_and_advantages(val_b, rew_b, done_b, config["gamma"], config["lam"])
 
@@ -337,7 +349,7 @@ def train_and_evaluate(env_id, seed, config, eval_every=5):
                   f"R={result['reward_mean']:7.1f}±{result['reward_se']:5.1f} | "
                   f"L={result['length_mean']:5.1f}±{result['length_std']:4.1f}")
 
-    return history, model
+    return history, model, optimizer
 
 
 # ─────────────────────────────────────────────
@@ -555,7 +567,7 @@ def save_csv(df, agg, config, save_dir):
             "reward_std": float(agg["reward_mean_std"]),
             "length_mean": float(agg["length_mean_mean"]),
             "length_std": float(agg["length_mean_std"]),
-        "length_se": float(agg["length_mean_std"]) / np.sqrt(agg["n_seeds"]),
+            "length_se": float(agg["length_mean_std"]) / np.sqrt(agg["n_seeds"]),
         },
         "n_seeds": agg["n_seeds"],
         "timestamp": ts_str,
@@ -564,6 +576,79 @@ def save_csv(df, agg, config, save_dir):
         json.dump(summary, f, indent=2)
     print(f"[Saved] {csv_path}")
     print(f"[Saved] {summary_path}")
+
+
+# ─────────────────────────────────────────────
+# 0. Checkpoint 管理
+# ─────────────────────────────────────────────
+def get_latest_checkpoint(save_dir):
+    """
+    查找 save_dir 下最新的 ppo_final_*.pt 文件。
+    返回 (checkpoint_path, config_path) 或 (None, None)。
+    """
+    pattern = os.path.join(save_dir, "ppo_final_*.pt")
+    files = glob.glob(pattern)
+    if not files:
+        return None, None
+    # 按修改时间排序，取最新的
+    latest_pt = max(files, key=os.path.getmtime)
+    # 同时间戳的 config 文件
+    basename = os.path.basename(latest_pt)  # e.g. ppo_final_20260406_123045.pt
+    ts_part = os.path.splitext(basename)[0]  # e.g. ppo_final_20260406_123045
+    config_path = os.path.join(save_dir, f"config_{ts_part}.json")
+    return latest_pt, config_path
+
+
+def save_checkpoint(model, optimizer, config, save_dir, current_update):
+    """
+    保存 model + optimizer + current_update + config。
+    返回 (model_path, config_path)
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = os.path.join(save_dir, f"ppo_final_{ts}.pt")
+    config_path = os.path.join(save_dir, f"config_{ts}.json")
+
+    torch.save({
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "current_update": current_update,
+    }, model_path)
+
+    config_with_meta = dict(config)
+    config_with_meta["_checkpoint_ts"] = ts
+    with open(config_path, "w") as f:
+        json.dump(config_with_meta, f, indent=2)
+    return model_path, config_path
+
+
+def load_checkpoint(checkpoint_path, config_path, device=DEVICE):
+    """
+    加载 checkpoint（包含 model + optimizer + current_update）和对应 config。
+    返回 (model, optimizer, config, current_update)
+    """
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    # 重建环境获取 obs/act 维度
+    env = gym.make(config["env_id"])
+    k_h = config.get("k_h", 0.0)
+    k_v = config.get("k_v", 0.0)
+    if k_h > 0 or k_v > 0:
+        env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.n
+    env.close()
+
+    model = ActorCritic(obs_dim, act_dim, hidden=config.get("hidden", 256)).to(device)
+    model.load_state_dict(ckpt["model_state"])
+
+    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+
+    current_update = ckpt.get("current_update", 1)
+    return model, optimizer, config, current_update
 
 
 # ─────────────────────────────────────────────
@@ -579,6 +664,12 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", type=int, default=1)
     parser.add_argument("--steps", type=int, default=2000000)
     parser.add_argument("--eval-every", type=int, default=1)
+    parser.add_argument("--load-latest", action="store_true",
+                        help="加载最新的 checkpoint 并只做评估，不训练")
+    parser.add_argument("--continue-train", action="store_true",
+                        help="加载最新的 checkpoint 并继续训练")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="指定 checkpoint 路径加载（优先级高于 --load-latest）")
     args = parser.parse_args()
 
     config = {
@@ -599,6 +690,83 @@ if __name__ == "__main__":
     print("=" * 70)
     print("PPO Evaluation Framework - 严谨研究版")
     print("=" * 70)
+
+    # ── 加载模式（评估） ──
+    if args.load_latest or args.checkpoint:
+        if args.checkpoint:
+            ckpt_path = args.checkpoint
+            ts_part = os.path.basename(ckpt_path).replace("ppo_final_", "").replace(".pt", "")
+            config_path = os.path.join(os.path.dirname(ckpt_path), f"config_{ts_part}.json")
+        else:
+            ckpt_path, config_path = get_latest_checkpoint(SAVE_DIR)
+
+        if ckpt_path is None or config_path is None:
+            print(f"[ERROR] 找不到 checkpoint，save_dir={SAVE_DIR}")
+            exit(1)
+
+        print(f"[Load] Checkpoint: {ckpt_path}")
+        print(f"[Load] Config:     {config_path}")
+        model, optimizer, config, current_update = load_checkpoint(ckpt_path, config_path)
+
+        print(f"[Info] current_update={current_update}, total_steps={config['total_steps']}")
+
+        if args.continue_train:
+            # 继续训练模式
+            print(f"\n[Continue Training] from update {current_update}")
+            env = gym.make(config["env_id"])
+            result = evaluate_honest(env, model, n_episodes=50)
+            print(f"  [Before Continue] SR={result['sr']*100:5.1f}% | R={result['reward_mean']:7.1f} | L={result['length_mean']:5.1f}")
+            env.close()
+
+            # 继续训练（单 seed，从当前 update 开始）
+            # 注：continue-train 默认单 seed，因为 checkpoint 是特定 seed 的
+            h, last_model, last_opt = train_and_evaluate(
+                config["env_id"],
+                seed=42,
+                config=config,
+                eval_every=args.eval_every,
+                start_update=current_update + 1,
+                loaded_model=model,
+                loaded_optimizer=optimizer,
+            )
+
+            # 保存新的 checkpoint
+            final_update = h["update"][-1] if h["update"] else current_update
+            model_path, config_path_new = save_checkpoint(last_model, last_opt, config, SAVE_DIR, final_update)
+            print(f"\n[Saved] Model: {model_path}")
+            print(f"[Saved] Config: {config_path_new}")
+
+            # 评估
+            env = gym.make(config["env_id"])
+            result = evaluate_honest(env, last_model, n_episodes=200)
+            print(f"\n[Final] SR={result['sr']*100:5.1f}%±{result['sr_se']*100:4.1f}% | "
+                  f"R={result['reward_mean']:7.1f}±{result['reward_se']:5.1f} | "
+                  f"L={result['length_mean']:5.1f}±{result['length_std']:4.1f}")
+            env.close()
+
+            # 录视频
+            eval_env = gym.make(config["env_id"], render_mode="rgb_array")
+            record_episode_videos(last_model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
+            eval_env.close()
+            print("\n[DONE - continued training]")
+        else:
+            # 仅评估模式
+            print("\n[Evaluate Loaded Model]")
+            env = gym.make(config["env_id"])
+            result = evaluate_honest(env, model, n_episodes=200)
+            print(f"  SR={result['sr']*100:5.1f}%±{result['sr_se']*100:4.1f}% | "
+                  f"R={result['reward_mean']:7.1f}±{result['reward_se']:5.1f} | "
+                  f"L={result['length_mean']:5.1f}±{result['length_std']:4.1f}")
+            env.close()
+
+            # 录视频
+            eval_env = gym.make(config["env_id"], render_mode="rgb_array")
+            record_episode_videos(model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
+            eval_env.close()
+            print("\n[DONE - load only]")
+        exit(0)
+
+    # ── 训练模式 ──
     print(f"  Config: {json.dumps(config, indent='  ')}")
     print(f"  Seeds:  {args.seeds}")
     print(f"  Device: {DEVICE}")
@@ -613,11 +781,12 @@ if __name__ == "__main__":
     # Multi-seed training
     print(f"\n[Training {args.seeds} seeds...]")
     all_histories = []
-    last_model = None
+    last_model, last_optimizer, last_update = None, None, 0
     for seed in range(42, 42 + args.seeds):
         print(f"\n  --- Seed {seed} ---")
-        h, last_model = train_and_evaluate(config["env_id"], seed, config, eval_every=args.eval_every)
+        h, last_model, last_optimizer = train_and_evaluate(config["env_id"], seed, config, eval_every=args.eval_every)
         all_histories.append(h)
+        last_update = h["update"][-1] if h["update"] else 0
 
     # Aggregate
     agg = aggregate_runs(all_histories, random_bl)
@@ -635,10 +804,10 @@ if __name__ == "__main__":
     print(f"  Improvement SR:   +{(agg['sr_mean'] - agg['random_sr'])*100:.1f}% over random")
     print("=" * 70)
 
-    # Save model from last seed
-    model_path = os.path.join(SAVE_DIR, f"ppo_final_{ts}.pt")
-    torch.save(last_model.state_dict(), model_path)
+    # 保存 checkpoint（model + optimizer + current_update + config）
+    model_path, config_path = save_checkpoint(last_model, last_optimizer, config, SAVE_DIR, last_update)
     print(f"\n[Saved] Model: {model_path}")
+    print(f"[Saved] Config: {config_path}")
 
     # Save
     path, df = plot_results(agg, config, SAVE_DIR)
