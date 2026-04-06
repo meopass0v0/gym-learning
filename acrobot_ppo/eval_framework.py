@@ -113,10 +113,9 @@ def compute_returns_and_advantages(val_buf, rew_buf, done_buf, gamma, lam):
         advantages[t] = next_gae
         next_value = val_buf[t].item()
 
-    # 标准化只给 actor 用，不污染 critic target
     raw_advantages = advantages.clone()
     advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-8)
-    returns = raw_advantages + val_buf  # 用未标准化的原始 advantage 给 critic
+    returns = raw_advantages + val_buf
     return returns, advantages
 
 
@@ -150,10 +149,6 @@ def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, returns_b, advantages
 # 5. Evaluation (诚实评估)
 # ─────────────────────────────────────────────
 def evaluate_honest(env, model, n_episodes=50):
-    """
-    诚实评估：区分 terminated（到达目标）和 truncated（超时）
-    返回完整 episode 数据，不只是平均值
-    """
     model.eval()
     rewards, lengths, success_flags = [], [], []
 
@@ -173,7 +168,6 @@ def evaluate_honest(env, model, n_episodes=50):
 
         rewards.append(total_r)
         lengths.append(steps)
-        # terminated + not truncated = 真正到达目标
         success_flags.append(done and not truncated)
 
     rewards = np.array(rewards)
@@ -196,7 +190,6 @@ def evaluate_honest(env, model, n_episodes=50):
 
 
 def evaluate_random(env, n_episodes=200):
-    """Random policy baseline，用于对比"""
     rewards, lengths, success_flags = [], [], []
     for _ in range(n_episodes):
         obs, _ = env.reset()
@@ -215,7 +208,6 @@ def evaluate_random(env, n_episodes=200):
         "rewards": rewards, "lengths": lengths, "success": success_flags,
         "sr": success_flags.mean(), "reward_mean": rewards.mean(), "length_mean": lengths.mean(),
     }
-
 
 
 # ─────────────────────────────────────────────
@@ -238,7 +230,6 @@ class RewardShapingWrapper(gym.Wrapper):
     def step(self, action):
         obs, base_reward, done, truncated, info = self.env.step(action)
 
-        # obs = [cos(theta1), sin(theta1), cos(theta2), sin(theta2), omega1, omega2]
         cos_t1, sin_t1 = obs[0], obs[1]
         cos_t2, sin_t2 = obs[2], obs[3]
         omega1 = obs[4]
@@ -246,13 +237,9 @@ class RewardShapingWrapper(gym.Wrapper):
         theta1 = np.arctan2(sin_t1, cos_t1)
         theta2 = np.arctan2(sin_t2, cos_t2)
 
-        # height shaping: k_h * (cos(theta1) + cos(theta1 + theta2))
         height_shaping = self.k_h * (cos_t1 + np.cos(theta1 + theta2))
-
-        # velocity shaping: k_v * omega1
         velocity_shaping = self.k_v * omega1
 
-        # 到达目标保持 0 reward
         if done and not truncated:
             shaped_reward = 0.0
         else:
@@ -261,19 +248,11 @@ class RewardShapingWrapper(gym.Wrapper):
         return obs, shaped_reward, done, truncated, info
 
 
-
 # ─────────────────────────────────────────────
 # 6. 完整训练 + 记录
 # ─────────────────────────────────────────────
 def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
                        loaded_model=None, loaded_optimizer=None):
-    """
-    单次训练 run，返回完整指标历史。
-
-    start_update: 从哪个 update 开始继续训练（用于断点续训）
-    loaded_model / loaded_optimizer: 如果从 checkpoint 加载，则传入
-    """
-    # 设置随机种子
     torch.manual_seed(seed)
     np.random.seed(seed)
     env = gym.make(env_id)
@@ -299,7 +278,6 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
     n_steps = config["n_steps"]
     total_updates = config["total_steps"] // n_steps
 
-    # 历史记录
     history = {
         "update": [], "timestep": [],
         "sr": [], "sr_se": [],
@@ -312,7 +290,6 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
         obs_b, act_b, rew_b, done_b, logp_b, val_b, ent_b = collect_rollout(env, model, n_steps)
         returns_b, advantages_b = compute_returns_and_advantages(val_b, rew_b, done_b, config["gamma"], config["lam"])
 
-        # 记录训练 loss
         with torch.no_grad():
             logp_new, ent_new, _ = model.get_action_and_logprob(obs_b, act_b)
             ratio = torch.exp(logp_new - logp_b)
@@ -328,7 +305,6 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
                     config["clip_range"], config["value_coef"], config["ent_coef"],
                     config["batch_size"], config["n_epochs"])
 
-        # 评估
         if it % eval_every == 0 or it == total_updates:
             result = evaluate_honest(env, model, n_episodes=50)
             ts = it * n_steps
@@ -356,13 +332,6 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
 # 7. 多 Seed 聚合统计
 # ─────────────────────────────────────────────
 def aggregate_runs(all_histories, random_baseline):
-    """
-    聚合多个 seed 的结果，计算 mean ± std
-    """
-    df = pd.DataFrame(all_histories[0])
-
-    # 按 timestep 对齐，不同样本数可能不同
-    # 简单做法：取最后一个 eval 点作为最终结果
     final = {m: [] for m in ["sr", "reward_mean", "length_mean"]}
     for h in all_histories:
         final["sr"].append(h["sr"][-1])
@@ -385,25 +354,16 @@ def aggregate_runs(all_histories, random_baseline):
     }
 
 
-
-
 # ─────────────────────────────────────────────
 # 9. Episode Video Recording
 # ─────────────────────────────────────────────
 def record_episode_videos(model, env, save_dir, n_success=1, n_failure=1):
-    """
-    Record episodes as MP4:
-    - n_success: first n_success successful episodes
-    - n_failure: first n_failure failed episodes
-    Records both success and failure cases for qualitative analysis.
-    """
     model.eval()
     success_frames, failure_frames = [], []
     success_meta, failure_meta = [], []
     max_frames = 1500
 
     print("\n[Video] Recording episodes...")
-    ep_count = 0
 
     for ep in range(n_success * 10 + n_failure * 10):
         obs, _ = env.reset()
@@ -413,7 +373,7 @@ def record_episode_videos(model, env, save_dir, n_success=1, n_failure=1):
         done = truncated = False
 
         while not (done or truncated):
-            frame = env.render()  # rgb_array
+            frame = env.render()
             ep_frames.append(frame)
             with torch.no_grad():
                 action, _, _, _ = model.get_action(obs_t, deterministic=True)
@@ -460,7 +420,6 @@ def record_episode_videos(model, env, save_dir, n_success=1, n_failure=1):
 def plot_results(agg, config, save_dir):
     histories = agg["all_histories"]
 
-    # 转换为 DataFrame 方便处理
     df = pd.DataFrame({
         "timestep": histories[0]["timestep"],
         "sr_mean": np.mean([h["sr"] for h in histories], axis=0),
@@ -480,10 +439,9 @@ def plot_results(agg, config, save_dir):
 
     ts = df["timestep"]
 
-    # 1. Success Rate with CI band
     ax = axes[0, 0]
     sr = df["sr_mean"].values
-    sr_err = df["sr_std"].values / np.sqrt(agg["n_seeds"]) * 1.96  # 95% CI
+    sr_err = df["sr_std"].values / np.sqrt(agg["n_seeds"]) * 1.96
     ax.plot(ts, sr, color=C.green, lw=2)
     ax.fill_between(ts, np.clip(sr - sr_err, 0, 1), np.clip(sr + sr_err, 0, 1),
                    color=C.green, alpha=0.15)
@@ -492,7 +450,6 @@ def plot_results(agg, config, save_dir):
     ax.set_title("Success Rate (95% CI band)"); ax.legend(); ax.grid(alpha=0.3)
     ax.set_ylim(0, 1.05)
 
-    # 2. Episode Reward with CI band
     ax = axes[0, 1]
     rm = df["reward_mean"].values
     rm_err = df["reward_std"].values / np.sqrt(agg["n_seeds"]) * 1.96
@@ -502,7 +459,6 @@ def plot_results(agg, config, save_dir):
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Avg Episode Reward")
     ax.set_title("Episode Reward (95% CI band)"); ax.legend(); ax.grid(alpha=0.3)
 
-    # 3. Episode Length with CI band
     ax = axes[0, 2]
     lm = df["length_mean"].values
     lm_err = df["length_std"].values / np.sqrt(agg["n_seeds"]) * 1.96
@@ -513,7 +469,6 @@ def plot_results(agg, config, save_dir):
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Avg Episode Length")
     ax.set_title("Episode Length (95% CI band)"); ax.legend(); ax.grid(alpha=0.3)
 
-    # 4. Individual seed runs (SR)
     ax = axes[1, 0]
     for i, h in enumerate(histories):
         ax.plot(h["timestep"], h["sr"], alpha=0.4, lw=1)
@@ -521,14 +476,12 @@ def plot_results(agg, config, save_dir):
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Success Rate")
     ax.set_title(f"Individual Seeds (n={agg['n_seeds']})"); ax.grid(alpha=0.3); ax.set_ylim(0, 1.05)
 
-    # 5. Policy & Value Loss
     ax = axes[1, 1]
     ax.plot(ts, df["pol_loss"], color=C.orange, lw=2, label="Policy Loss")
     ax.plot(ts, df["val_loss"], color=C.blue, lw=2, label="Value Loss")
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Loss")
     ax.set_title("Training Losses"); ax.legend(); ax.grid(alpha=0.3)
 
-    # 6. Entropy
     ax = axes[1, 2]
     ax.plot(ts, df["entropy"], color=C.purple, lw=2)
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Entropy")
@@ -545,12 +498,10 @@ def plot_results(agg, config, save_dir):
 
 
 def save_csv(df, agg, config, save_dir):
-    """保存 CSV 用于后续分析"""
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(save_dir, f"eval_data_{ts_str}.csv")
     df.to_csv(csv_path, index=False)
 
-    # 保存汇总统计
     summary_path = os.path.join(save_dir, f"eval_summary_{ts_str}.json")
     summary = {
         "config": config,
@@ -590,11 +541,11 @@ def get_latest_checkpoint(save_dir):
     files = glob.glob(pattern)
     if not files:
         return None, None
-    # 按修改时间排序，取最新的
+
     latest_pt = max(files, key=os.path.getmtime)
-    # 同时间戳的 config 文件
-    basename = os.path.basename(latest_pt)  # e.g. ppo_final_20260406_123045.pt
-    ts_part = os.path.splitext(basename)[0]  # e.g. ppo_final_20260406_123045
+    basename = os.path.basename(latest_pt)
+    # e.g. ppo_final_20260406_123045.pt → ts_part = 20260406_123045
+    ts_part = os.path.splitext(basename)[0].replace("ppo_final_", "")
     config_path = os.path.join(save_dir, f"config_{ts_part}.json")
     return latest_pt, config_path
 
@@ -602,7 +553,6 @@ def get_latest_checkpoint(save_dir):
 def save_checkpoint(model, optimizer, config, save_dir, current_update):
     """
     保存 model + optimizer + current_update + config。
-    返回 (model_path, config_path)
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_path = os.path.join(save_dir, f"ppo_final_{ts}.pt")
@@ -631,7 +581,6 @@ def load_checkpoint(checkpoint_path, config_path, device=DEVICE):
 
     ckpt = torch.load(checkpoint_path, map_location=device)
 
-    # 重建环境获取 obs/act 维度
     env = gym.make(config["env_id"])
     k_h = config.get("k_h", 0.0)
     k_v = config.get("k_v", 0.0)
@@ -692,11 +641,11 @@ if __name__ == "__main__":
     print("=" * 70)
 
     # ── 加载 + 评估/续训练 模式 ──
-    # --continue-train 隐含了需要先 load，所以也进入这个分支
     if args.load_latest or args.checkpoint or args.continue_train:
         if args.checkpoint:
             ckpt_path = args.checkpoint
-            ts_part = os.path.basename(ckpt_path).replace("ppo_final_", "").replace(".pt", "")
+            basename = os.path.basename(ckpt_path)
+            ts_part = os.path.splitext(basename)[0].replace("ppo_final_", "")
             config_path = os.path.join(os.path.dirname(ckpt_path), f"config_{ts_part}.json")
         else:
             ckpt_path, config_path = get_latest_checkpoint(SAVE_DIR)
@@ -719,8 +668,6 @@ if __name__ == "__main__":
             print(f"  [Before Continue] SR={result['sr']*100:5.1f}% | R={result['reward_mean']:7.1f} | L={result['length_mean']:5.1f}")
             env.close()
 
-            # 继续训练（单 seed，从当前 update 开始）
-            # 注：continue-train 默认单 seed，因为 checkpoint 是特定 seed 的
             h, last_model, last_opt = train_and_evaluate(
                 config["env_id"],
                 seed=42,
@@ -731,13 +678,11 @@ if __name__ == "__main__":
                 loaded_optimizer=optimizer,
             )
 
-            # 保存新的 checkpoint
             final_update = h["update"][-1] if h["update"] else current_update
             model_path, config_path_new = save_checkpoint(last_model, last_opt, config, SAVE_DIR, final_update)
             print(f"\n[Saved] Model: {model_path}")
             print(f"[Saved] Config: {config_path_new}")
 
-            # 评估
             env = gym.make(config["env_id"])
             result = evaluate_honest(env, last_model, n_episodes=200)
             print(f"\n[Final] SR={result['sr']*100:5.1f}%±{result['sr_se']*100:4.1f}% | "
@@ -745,7 +690,6 @@ if __name__ == "__main__":
                   f"L={result['length_mean']:5.1f}±{result['length_std']:4.1f}")
             env.close()
 
-            # 录视频
             eval_env = gym.make(config["env_id"], render_mode="rgb_array")
             record_episode_videos(last_model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
             eval_env.close()
@@ -760,7 +704,6 @@ if __name__ == "__main__":
                   f"L={result['length_mean']:5.1f}±{result['length_std']:4.1f}")
             env.close()
 
-            # 录视频
             eval_env = gym.make(config["env_id"], render_mode="rgb_array")
             record_episode_videos(model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
             eval_env.close()
@@ -773,13 +716,11 @@ if __name__ == "__main__":
     print(f"  Device: {DEVICE}")
     print("=" * 70)
 
-    # Random baseline
     print("\n[Random Baseline]")
     env = gym.make(config["env_id"])
     random_bl = evaluate_random(env, n_episodes=500)
     print(f"  SR={random_bl['sr']*100:.1f}% | R={random_bl['reward_mean']:.1f} | L={random_bl['length_mean']:.1f}")
 
-    # Multi-seed training
     print(f"\n[Training {args.seeds} seeds...]")
     all_histories = []
     last_model, last_optimizer, last_update = None, None, 0
@@ -789,7 +730,6 @@ if __name__ == "__main__":
         all_histories.append(h)
         last_update = h["update"][-1] if h["update"] else 0
 
-    # Aggregate
     agg = aggregate_runs(all_histories, random_bl)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -805,16 +745,13 @@ if __name__ == "__main__":
     print(f"  Improvement SR:   +{(agg['sr_mean'] - agg['random_sr'])*100:.1f}% over random")
     print("=" * 70)
 
-    # 保存 checkpoint（model + optimizer + current_update + config）
     model_path, config_path = save_checkpoint(last_model, last_optimizer, config, SAVE_DIR, last_update)
     print(f"\n[Saved] Model: {model_path}")
     print(f"[Saved] Config: {config_path}")
 
-    # Save
     path, df = plot_results(agg, config, SAVE_DIR)
     save_csv(df, agg, config, SAVE_DIR)
 
-    # Record episode videos
     eval_env = gym.make(config["env_id"], render_mode="rgb_array")
     record_episode_videos(last_model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
     eval_env.close()
