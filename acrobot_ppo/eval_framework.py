@@ -669,7 +669,7 @@ if __name__ == "__main__":
     parser.add_argument("--continue-train", action="store_true",
                         help="加载最新的 checkpoint 并继续训练")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="指定 checkpoint 路径加载（优先级高于 --load-latest）")
+                        help="指定 checkpoint 路径加载")
     args = parser.parse_args()
 
     config = {
@@ -691,8 +691,9 @@ if __name__ == "__main__":
     print("PPO Evaluation Framework - 严谨研究版")
     print("=" * 70)
 
-    # ── 加载模式（评估） ──
-    if args.load_latest or args.checkpoint:
+    # ── 加载 + 评估/续训练 模式 ──
+    # --continue-train 隐含了需要先 load，所以也进入这个分支
+    if args.load_latest or args.checkpoint or args.continue_train:
         if args.checkpoint:
             ckpt_path = args.checkpoint
             ts_part = os.path.basename(ckpt_path).replace("ppo_final_", "").replace(".pt", "")
@@ -711,7 +712,7 @@ if __name__ == "__main__":
         print(f"[Info] current_update={current_update}, total_steps={config['total_steps']}")
 
         if args.continue_train:
-            # 继续训练模式
+            # ── 继续训练模式 ──
             print(f"\n[Continue Training] from update {current_update}")
             env = gym.make(config["env_id"])
             result = evaluate_honest(env, model, n_episodes=50)
@@ -750,7 +751,7 @@ if __name__ == "__main__":
             eval_env.close()
             print("\n[DONE - continued training]")
         else:
-            # 仅评估模式
+            # ── 仅评估模式 ──
             print("\n[Evaluate Loaded Model]")
             env = gym.make(config["env_id"])
             result = evaluate_honest(env, model, n_episodes=200)
