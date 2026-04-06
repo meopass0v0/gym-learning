@@ -7,11 +7,7 @@ PPO Evaluation Framework - Critic-Separated Architecture
 3. Critic 独立优化器，lr 可单独配置
 4. Critic 每个 batch 更新多次（critic_n_epochs > n_epochs）
 5. 支持 --critic-hidden, --critic-lr, --critic-n-epochs 参数
-
-理论依据：
-- Actor 100% 成功说明策略结构没问题
-- 62 vs 60 这种细微 reward 差距需要更精细的 value 估计
-- Advantage = r + gamma*V(s') - V(s)，value 估计不准则 advantage 信号噪声大
+6. 势函数 Reward Shaping：Φ(s) = 0.8*h_norm + 0.2*tanh(0.05*(ω1²+ω2²))
 """
 
 import gymnasium as gym
@@ -37,26 +33,15 @@ SAVE_DIR = r"C:\gym-learning\acrobot_ppo"
 # 1. Actor-Critic Network (Separated Backbones)
 # ─────────────────────────────────────────────
 class ActorCriticSep(nn.Module):
-    """
-    Actor 和 Critic 分离 backbone，各自独立学习。
-
-    设计考量：
-    - Actor 需要保持策略分布的平滑性，不宜过大
-    - Critic 需要更精细的状态价值估计，更大 hidden 能捕获更复杂的状态差异
-    - 分离后各自优化互不干扰
-    """
-
     def __init__(self, obs_dim, act_dim, hidden=256, critic_hidden=512):
         super().__init__()
 
-        # Actor backbone：保持和原来一样的大小
         self.actor_net = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
         )
         self.actor_head = nn.Linear(hidden, act_dim)
 
-        # Critic backbone：更大，更深
         self.critic_net = nn.Sequential(
             nn.Linear(obs_dim, critic_hidden), nn.Tanh(),
             nn.Linear(critic_hidden, critic_hidden), nn.Tanh(),
@@ -65,15 +50,10 @@ class ActorCriticSep(nn.Module):
         self.critic_head = nn.Linear(critic_hidden // 2, 1)
 
     def forward(self, x):
-        """
-        返回 (logits, value)
-        """
         actor_features = self.actor_net(x)
         logits = self.actor_head(actor_features)
-
         critic_features = self.critic_net(x)
         value = self.critic_head(critic_features).squeeze(-1)
-
         return logits, value
 
     def get_action(self, obs, deterministic=False):
@@ -150,26 +130,20 @@ def compute_returns_and_advantages(val_buf, rew_buf, done_buf, gamma, lam):
 
 
 # ─────────────────────────────────────────────
-# 4. PPO Update (分离 Critic 更新)
+# 4. PPO Update (Separated)
 # ─────────────────────────────────────────────
 def ppo_update_separated(model, actor_opt, critic_opt,
                          obs_b, act_b, old_logp_b, returns_b, advantages_b,
                          clip_range, ent_coef,
                          batch_size, n_epochs, critic_n_epochs):
-    """
-    分离的 PPO 更新：
-    - Actor 每 batch 更新 n_epochs 次
-    - Critic 每 batch 更新 critic_n_epochs 次（更多次，更强的 value 学习）
-    """
     n = obs_b.shape[0]
 
-    # ── Critic 更新（多个 epoch）──
+    # Critic update (multiple epochs)
     for _ in range(critic_n_epochs):
         idx = torch.randperm(n, device=DEVICE)
         for start in range(0, n, batch_size):
             mb = idx[start:start + batch_size]
             _, _, val = model.get_action_and_logprob(obs_b[mb], act_b[mb])
-            # 用 returns 作为 target，mse loss
             critic_loss = nn.functional.mse_loss(val, returns_b[mb])
             critic_opt.zero_grad()
             critic_loss.backward()
@@ -177,7 +151,7 @@ def ppo_update_separated(model, actor_opt, critic_opt,
             torch.nn.utils.clip_grad_norm_(model.critic_head.parameters(), 0.5)
             critic_opt.step()
 
-    # ── Actor 更新 ──
+    # Actor update
     for _ in range(n_epochs):
         idx = torch.randperm(n, device=DEVICE)
         for start in range(0, n, batch_size):
@@ -263,31 +237,98 @@ def evaluate_random(env, n_episodes=200):
 
 
 # ─────────────────────────────────────────────
-# Reward Shaping Wrapper
+# Potential-Based Reward Shaping
 # ─────────────────────────────────────────────
-class RewardShapingWrapper(gym.Wrapper):
-    def __init__(self, env, k_h=0.0, k_v=0.0):
+def compute_phi(obs):
+    """
+    势函数：Phi(s) = 0.8 * h_norm + 0.2 * tanh(0.05 * (omega1^2 + omega2^2))
+
+    Acrobot state: [cos(t1), sin(t1), cos(t2), sin(t2), omega1, omega2]
+    - theta1 = arctan2(sin_t1, cos_t1): link1 相对垂直方向的角度
+    - theta2 = arctan2(sin_t2, cos_t2): link2 相对 link1 延长线的角度
+    - omega1, omega2: 角速度
+
+    Tip height (normalized):
+    - L1=L2=1, 固定点在 (0,0)
+    - y_tip = -L1*cos(theta1) - L2*cos(theta1+theta2) = -(cos_t1 + cos(t1+t2))
+    - h_norm = y_tip / 2 ∈ [-1, 1]  (向下-1, 向上+1)
+    - h_norm_adj = (h_norm + 1) / 2 ∈ [0, 1]
+    """
+    cos_t1, sin_t1 = obs[0], obs[1]
+    cos_t2, sin_t2 = obs[2], obs[3]
+    omega1, omega2 = obs[4], obs[5]
+
+    theta1 = np.arctan2(sin_t1, cos_t1)
+    theta2 = np.arctan2(sin_t2, cos_t2)
+
+    # Tip height normalized to [-1, 1]: y_tip/2 where y_tip = -(cos_t1 + cos(t1+t2))
+    h_raw = -(cos_t1 + np.cos(theta1 + theta2))
+    h_norm = h_raw / 2.0  # ∈ [-1, 1]
+    h_norm_adj = (h_norm + 1.0) / 2.0  # ∈ [0, 1]
+
+    # Angular velocity term (normalized, bounded)
+    omega_term = 0.2 * np.tanh(0.05 * (omega1**2 + omega2**2))
+
+    phi = 0.8 * h_norm_adj + omega_term
+    return phi
+
+
+class PotentialShapingWrapper(gym.Wrapper):
+    """
+    势函数 Reward Shaping：
+
+    r'(s, a, s') = r(s, a, s') + α * (γ * Φ(s') - Φ(s))
+
+    其中 Φ(s) = 0.8 * h_norm_adj + 0.2 * tanh(0.05 * (ω1² + ω2²))
+
+    关键设计：
+    - Φ 只用于前后差分，不直接当 reward（保证 IRL 兼容性）
+    - α 从初始值线性退火到 0（后期只靠原始 reward）
+    - 到达目标时 shaping reward = 0（保持原始 termination reward）
+    """
+
+    def __init__(self, env, phi_alpha=0.5, phi_gamma=0.99, phi_anneal_steps=None):
         super().__init__(env)
-        self.k_h = k_h
-        self.k_v = k_v
+        self.phi_alpha = phi_alpha
+        self.phi_gamma = phi_gamma
+        # phi_anneal_steps=None 表示不退火，phi_alpha 保持不变
+        self.phi_anneal_steps = phi_anneal_steps if phi_anneal_steps is not None else float('inf')
+        self.total_steps = 0
+        self.prev_phi = None  # Φ(s) for previous state
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.prev_phi = compute_phi(obs)
+        self.total_steps = 0
+        return obs, info
 
     def step(self, action):
         obs, base_reward, done, truncated, info = self.env.step(action)
 
-        cos_t1, sin_t1 = obs[0], obs[1]
-        cos_t2, sin_t2 = obs[2], obs[3]
-        omega1 = obs[4]
+        # 计算当前势 Φ(s')
+        curr_phi = compute_phi(obs)
 
-        theta1 = np.arctan2(sin_t1, cos_t1)
-        theta2 = np.arctan2(sin_t2, cos_t2)
-
-        height_shaping = self.k_h * (cos_t1 + np.cos(theta1 + theta2))
-        velocity_shaping = self.k_v * omega1
-
-        if done and not truncated:
-            shaped_reward = 0.0
+        # α 退火：线性从 phi_alpha 衰减到 0
+        if self.total_steps < self.phi_anneal_steps:
+            frac = 1.0 - (self.total_steps / self.phi_anneal_steps)
+            alpha_t = self.phi_alpha * frac
         else:
-            shaped_reward = base_reward + height_shaping + velocity_shaping
+            alpha_t = 0.0
+
+        # 势函数 shaping reward
+        # 注意：到达目标时（done and not truncated）保持 r'=0
+        if done and not truncated:
+            shaping = 0.0
+        elif self.prev_phi is not None:
+            shaping = alpha_t * (self.phi_gamma * curr_phi - self.prev_phi)
+        else:
+            shaping = 0.0
+
+        shaped_reward = base_reward + shaping
+
+        # 更新
+        self.prev_phi = curr_phi
+        self.total_steps += 1
 
         return obs, shaped_reward, done, truncated, info
 
@@ -301,10 +342,21 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
     np.random.seed(seed)
     env = gym.make(env_id)
     env.reset(seed=seed)
-    k_h = config.get("k_h", 0.0)
-    k_v = config.get("k_v", 0.0)
-    if k_h > 0 or k_v > 0:
-        env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
+
+    # 势函数 shaping（优先级高于旧的 k_h/k_v）
+    use_phi = config.get("phi_alpha", 0.0) > 0
+    if use_phi:
+        phi_alpha = config.get("phi_alpha", 0.5)
+        phi_gamma = config.get("phi_gamma", 0.99)
+        phi_anneal = config.get("phi_anneal_steps", None)
+        env = PotentialShapingWrapper(env, phi_alpha=phi_alpha, phi_gamma=phi_gamma,
+                                      phi_anneal_steps=phi_anneal)
+        print(f"  [PotentialShaping] alpha={phi_alpha}, gamma={phi_gamma}, anneal_steps={phi_anneal}")
+    else:
+        k_h = config.get("k_h", 0.0)
+        k_v = config.get("k_v", 0.0)
+        if k_h > 0 or k_v > 0:
+            env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
 
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
@@ -317,15 +369,11 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
     else:
         model = ActorCriticSep(obs_dim, act_dim, hidden=hidden, critic_hidden=critic_hidden).to(DEVICE)
 
-    # 分离的优化器
     if loaded_actor_opt is not None:
         actor_opt = loaded_actor_opt
     else:
         actor_opt = optim.Adam(model.actor_net.parameters(), lr=config["lr"])
-        actor_opt.add_param_group({
-            "params": model.actor_head.parameters(),
-            "lr": config["lr"]
-        })
+        actor_opt.add_param_group({"params": model.actor_head.parameters(), "lr": config["lr"]})
 
     if loaded_critic_opt is not None:
         critic_opt = loaded_critic_opt
@@ -339,7 +387,7 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
     n_steps = config["n_steps"]
     total_updates = config["total_steps"] // n_steps
     n_epochs = config.get("n_epochs", 10)
-    critic_n_epochs = config.get("critic_n_epochs", 4)  # 默认 critic 更新更多次
+    critic_n_epochs = config.get("critic_n_epochs", 4)
     batch_size = config.get("batch_size", 256)
 
     history = {
@@ -354,7 +402,6 @@ def train_and_evaluate(env_id, seed, config, eval_every=5, start_update=1,
         obs_b, act_b, rew_b, done_b, logp_b, val_b, ent_b = collect_rollout(env, model, n_steps)
         returns_b, advantages_b = compute_returns_and_advantages(val_b, rew_b, done_b, config["gamma"], config["lam"])
 
-        # 记录训练 loss（用更新前的模型）
         with torch.no_grad():
             logp_new, ent_new, val_new = model.get_action_and_logprob(obs_b, act_b)
             ratio = torch.exp(logp_new - logp_b)
@@ -501,8 +548,12 @@ def plot_results(agg, config, save_dir):
     })
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-    fig.suptitle(f"PPO Sep-Critic on {config['env_id']} | {agg['n_seeds']} seeds | "
-                 f"lr={config['lr']} critic_lr={config.get('critic_lr','?')}", fontsize=13, fontweight="bold")
+
+    shaping_note = ""
+    if config.get("phi_alpha", 0) > 0:
+        shaping_note = f" | phi_alpha={config['phi_alpha']}"
+    fig.suptitle(f"PPO Sep-Critic on {config['env_id']} | {agg['n_seeds']} seeds{shaping_note}",
+                 fontsize=13, fontweight="bold")
 
     ts = df["timestep"]
 
@@ -585,7 +636,6 @@ def save_csv(df, agg, config, save_dir):
             "reward_std": float(agg["reward_mean_std"]),
             "length_mean": float(agg["length_mean_mean"]),
             "length_std": float(agg["length_mean_std"]),
-            "length_se": float(agg["length_mean_std"]) / np.sqrt(agg["n_seeds"]),
         },
         "n_seeds": agg["n_seeds"],
         "timestamp": ts_str,
@@ -638,14 +688,10 @@ def load_checkpoint(checkpoint_path, config_path, device=DEVICE, default_config=
             with open(config_path, "r") as f:
                 config = json.load(f)
         else:
-            print(f"[WARN] config file not found, using default")
+            print(f"[WARN] config file not found")
             config = dict(default_config) if default_config else get_default_config()
 
         env = gym.make(config["env_id"])
-        k_h = config.get("k_h", 0.0)
-        k_v = config.get("k_v", 0.0)
-        if k_h > 0 or k_v > 0:
-            env = RewardShapingWrapper(env, k_h=k_h, k_v=k_v)
         obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.n
         env.close()
@@ -671,10 +717,8 @@ def load_checkpoint(checkpoint_path, config_path, device=DEVICE, default_config=
 
         current_update = ckpt.get("current_update", 1)
     else:
-        # 旧格式
-        print(f"[WARN] Old checkpoint format, using default config")
+        print(f"[WARN] Old checkpoint format")
         config = dict(default_config) if default_config else get_default_config()
-
         env = gym.make(config["env_id"])
         obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.n
@@ -682,7 +726,6 @@ def load_checkpoint(checkpoint_path, config_path, device=DEVICE, default_config=
 
         model = ActorCriticSep(obs_dim, act_dim).to(device)
         model.load_state_dict(ckpt)
-
         actor_opt = optim.Adam(model.actor_net.parameters(), lr=config["lr"])
         critic_opt = optim.Adam(
             list(model.critic_net.parameters()) + list(model.critic_head.parameters()),
@@ -706,10 +749,13 @@ def get_default_config():
         "gamma": 0.99,
         "lam": 0.95,
         "clip_range": 0.2,
-        "value_coef": 0.5,
         "ent_coef": 0.01,
         "hidden": 256,
         "critic_hidden": 512,
+        # Potential shaping
+        "phi_alpha": 0.0,
+        "phi_gamma": 0.99,
+        "phi_anneal_steps": None,
     }
 
 
@@ -729,11 +775,18 @@ if __name__ == "__main__":
     parser.add_argument("--load-latest", action="store_true")
     parser.add_argument("--continue-train", action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
-    # Critic 相关参数
-    parser.add_argument("--hidden", type=int, default=256, help="Actor hidden size")
-    parser.add_argument("--critic-hidden", type=int, default=512, help="Critic hidden size")
-    parser.add_argument("--critic-lr", type=float, default=1e-3, help="Critic learning rate")
-    parser.add_argument("--critic-n-epochs", type=int, default=4, help="Critic updates per batch")
+    # Critic
+    parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--critic-hidden", type=int, default=512)
+    parser.add_argument("--critic-lr", type=float, default=1e-3)
+    parser.add_argument("--critic-n-epochs", type=int, default=4)
+    # Potential shaping
+    parser.add_argument("--phi-alpha", type=float, default=0.0,
+                        help="Potential shaping strength (0=disabled)")
+    parser.add_argument("--phi-gamma", type=float, default=0.99,
+                        help="Potential shaping discount factor")
+    parser.add_argument("--phi-anneal-steps", type=int, default=None,
+                        help="Steps to anneal phi_alpha to 0 (None=no anneal)")
     args = parser.parse_args()
 
     config = {
@@ -748,22 +801,30 @@ if __name__ == "__main__":
         "gamma": 0.99,
         "lam": 0.95,
         "clip_range": 0.2,
-        "value_coef": 0.5,
         "ent_coef": 0.01,
         "hidden": args.hidden,
         "critic_hidden": args.critic_hidden,
+        "phi_alpha": args.phi_alpha,
+        "phi_gamma": args.phi_gamma,
+        "phi_anneal_steps": args.phi_anneal_steps,
     }
 
+    shaping_str = ""
+    if config["phi_alpha"] > 0:
+        shaping_str = f" | Potential Shaping: alpha={config['phi_alpha']}, gamma={config['phi_gamma']}"
+        if config["phi_anneal_steps"]:
+            shaping_str += f", anneal={config['phi_anneal_steps']} steps"
+
     print("=" * 70)
-    print("PPO Evaluation Framework - Critic-Separated Architecture")
+    print("PPO Evaluation Framework - Critic-Separated + Potential Shaping")
     print("=" * 70)
     print(f"  Actor hidden:     {config['hidden']}")
     print(f"  Critic hidden:    {config['critic_hidden']}")
     print(f"  Actor lr:         {config['lr']}")
     print(f"  Critic lr:        {config['critic_lr']}")
-    print(f"  Critic n_epochs:  {config['critic_n_epochs']} (per batch)")
+    print(f"  Critic n_epochs:  {config['critic_n_epochs']}{shaping_str}")
     print(f"  Seeds:            {args.seeds}")
-    print(f"  Device:          {DEVICE}")
+    print(f"  Device:           {DEVICE}")
     print("=" * 70)
 
     if args.load_latest or args.checkpoint or args.continue_train:
@@ -789,6 +850,11 @@ if __name__ == "__main__":
         if args.continue_train:
             print(f"\n[Continue Training] from update {current_update}")
             env = gym.make(config["env_id"])
+            if config.get("phi_alpha", 0) > 0:
+                env = PotentialShapingWrapper(env,
+                    phi_alpha=config["phi_alpha"],
+                    phi_gamma=config["phi_gamma"],
+                    phi_anneal_steps=config["phi_anneal_steps"])
             result = evaluate_honest(env, model, n_episodes=50)
             print(f"  [Before] SR={result['sr']*100:5.1f}% | R={result['reward_mean']:7.1f}")
             env.close()
@@ -808,17 +874,32 @@ if __name__ == "__main__":
             print(f"\n[Saved] Model: {model_path}")
 
             env = gym.make(config["env_id"])
+            if config.get("phi_alpha", 0) > 0:
+                env = PotentialShapingWrapper(env,
+                    phi_alpha=config["phi_alpha"],
+                    phi_gamma=config["phi_gamma"],
+                    phi_anneal_steps=config["phi_anneal_steps"])
             result = evaluate_honest(env, last_model, n_episodes=200)
             print(f"\n[Final] SR={result['sr']*100:5.1f}% | R={result['reward_mean']:7.1f}")
             env.close()
 
             eval_env = gym.make(config["env_id"], render_mode="rgb_array")
+            if config.get("phi_alpha", 0) > 0:
+                eval_env = PotentialShapingWrapper(eval_env,
+                    phi_alpha=config["phi_alpha"],
+                    phi_gamma=config["phi_gamma"],
+                    phi_anneal_steps=config["phi_anneal_steps"])
             record_episode_videos(last_model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
             eval_env.close()
             print("\n[DONE]")
         else:
             print("\n[Evaluate]")
             env = gym.make(config["env_id"])
+            if config.get("phi_alpha", 0) > 0:
+                env = PotentialShapingWrapper(env,
+                    phi_alpha=config["phi_alpha"],
+                    phi_gamma=config["phi_gamma"],
+                    phi_anneal_steps=config["phi_anneal_steps"])
             result = evaluate_honest(env, model, n_episodes=200)
             print(f"  SR={result['sr']*100:5.1f}% | R={result['reward_mean']:7.1f}")
             env.close()
@@ -861,6 +942,11 @@ if __name__ == "__main__":
     save_csv(df, agg, config, SAVE_DIR)
 
     eval_env = gym.make(config["env_id"], render_mode="rgb_array")
+    if config.get("phi_alpha", 0) > 0:
+        eval_env = PotentialShapingWrapper(eval_env,
+            phi_alpha=config["phi_alpha"],
+            phi_gamma=config["phi_gamma"],
+            phi_anneal_steps=config["phi_anneal_steps"])
     record_episode_videos(last_model, eval_env, SAVE_DIR, n_success=2, n_failure=2)
     eval_env.close()
 
