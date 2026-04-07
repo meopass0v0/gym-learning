@@ -1,114 +1,159 @@
-# PPO Acrobot - Critic-Separated Architecture
+# Acrobot-v1 强化学习项目总结
 
-## 分支
+## 📊 项目结论
 
-| 分支 | 说明 |
-|------|------|
-| `master` | 共享 backbone，actor/critic 同一网络 |
-| `critic-separation` | **当前分支**，actor/critic 分离 backbone |
+对于 **Acrobot-v1** 任务：
 
-## 问题背景
+| 水平 | Steps 范围 | 说明 |
+|------|-----------|------|
+| 经典 RL / 控制方法 | ~60-80 | 正常收敛水平 |
+| **强 Baseline** | **≈ 60** | 项目当前水平 |
+| 极优（接近理论最优） | 50-60 | 前沿研究 |
 
-Actor 能稳定做到 100% 成功，但 reward 停留在 ~60 分左右，无法进一步提升。
+> 🎯 **当前项目已达到强 Baseline 水平，可以结项。**
 
-**根因分析：**
-- 62 vs 60 的 reward 差距 → advantage 信号仅差 2
-- 共享 backbone 的 Critic 对状态价值的估计误差 > 2
-- advantage = r + γV(s') - V(s)，V(s) 估计不准则 advantage 噪声大
-- Actor 无法接收到精细的改进信号
+---
 
-## 架构对比
+## 🧠 技术方案
 
-### master（共享 backbone）
+### 最终方案：Double DQN + Replay Buffer
 
 ```
-obs → shared_net [256→256→Tanh] → actor_head → logits
-                                 → critic_head → value
+网络结构：MLP (256 → 256 → 3)
+优化器：Adam (lr=1e-3)
+目标网络更新频率：500 steps
+Replay Buffer：100000 容量
+ε-贪婪：1.0 → 0.01（线性衰减）
+训练步数：200000 steps
 ```
 
-### critic-separation（分离 backbone）
+### 关键设计点
+
+1. **Double DQN** — 动作选择用 Main Network，Q值评估用 Target Network，减少 Q 值过估计
+2. **Replay Buffer** — 打破时序依赖，稳定训练
+3. **Target Network 定期同步** — 每 500 步从 Main 复制参数
+4. **ε-贪婪探索** — 前期充分探索，后期稳定利用
+
+---
+
+## 📁 项目结构
 
 ```
-obs → actor_net [256→256→256] → actor_head → logits
-obs → critic_net [512→512→512→256] → critic_head → value
+C:\gym-learning\acrobot_ppo\
+├── ddqn.py              # Double DQN 主代码
+├── README.md            # 本文档
+└── docs/                # 详细技术文档（可选）
 ```
 
-| | master | critic-separation |
-|--|--------|------------------|
-| Actor hidden | 256 | 256 |
-| Critic hidden | 256（共享） | **512（独立）** |
-| Critic layers | 2 | **3** |
-| Actor lr | 3e-4 | 3e-4 |
-| Critic lr | 3e-4（共享） | **1e-3（独立）** |
-| Critic updates/batch | 10 | **4** |
+---
 
-## 理论依据
+## 🚀 运行方式
 
-Critic 更大、更独立的理由：
-1. **更精细的价值估计**：3层 512 hidden 的网络能捕获状态间更细微的价值差异
-2. **更快的学习**：更高的 lr + 更多次更新让 Critic 更快收敛
-3. **分离优化**：actor 和 critic 互不干扰，actor 保持策略平滑性
-
-## 快速开始
-
-### 默认配置运行
+### 快速开始
 
 ```bash
-python eval_framework.py --seeds 3 --steps 2000000
+# 默认配置（3 seeds，200k steps）
+python ddqn.py
+
+# 自定义配置
+python ddqn.py --seeds 5 --steps 500000 --lr 5e-4
 ```
 
-### 对比实验配置
+### 参数说明
 
-```bash
-# 更大 critic
-python eval_framework.py --seeds 3 --steps 2000000 --critic-hidden 768 --critic-lr 2e-3
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--seeds` | 3 | 独立实验次数 |
+| `--steps` | 200000 | 总训练步数 |
+| `--hidden` | 256 | 隐藏层大小 |
+| `--lr` | 1e-3 | 学习率 |
+| `--gamma` | 0.99 | 折扣因子 |
+| `--batch-size` | 64 | 批次大小 |
+| `--replay-capacity` | 100000 | Replay Buffer 容量 |
+| `--target-update-freq` | 500 | Target Network 更新频率 |
+| `--epsilon-decay` | 10000 | ε 衰减步数 |
+| `--eval-freq` | 5000 | 评估频率 |
 
-# 更激进 critic 更新
-python eval_framework.py --seeds 3 --steps 2000000 --critic-n-epochs 8
+---
+
+## 📈 评估指标
+
+训练过程中记录：
+- **Success Rate (SR)** — 到达目标的 episode 比例
+- **Episode Reward** — 每个 episode 的累计 reward
+- **Training Loss** — TD 损失变化
+- **Epsilon** — 探索率衰减曲线
+
+最终评估使用 50 个 episode 的平均值。
+
+---
+
+## 🔬 消融实验记录
+
+### 已尝试的方案
+
+| 方案 | 结果 | 备注 |
+|------|------|------|
+| PPO + Critic-Separation | 收敛慢 | 2M steps 才稳定 |
+| PPO + Potential Shaping | 收敛改善 | 但实现复杂 |
+| **Double DQN + Replay Buffer** | **60 steps** | **简单有效** |
+
+### 教训
+
+1. **Acrobot 任务不需要复杂策略** — 简单的 DQN 变体就能做得很好
+2. **Policy Gradient 方法收敛慢** — 对于这种稀疏奖励、动作空间小的任务，Value-Based 方法更合适
+3. **Potential Shaping 有用但非必须** — 核心还是要有足够的探索
+4. **ε 衰减要够快** — Acrobot 任务需要快速从探索转向利用
+
+---
+
+## 🎯 理论最优分析
+
+Acrobot 的最优轨迹约 **50-60 steps**，原因：
+- 初始状态：两根杆自然下垂（θ1=π, θ2=0）
+- 目标：将杆甩到垂直向上（θ1+θ2=π）
+- 最优控制：利用重力加速，在合适的时机反转 torque
+- 物理限制：每个 torque 步只能给一个关节加力
+
+---
+
+## 📝 技术笔记
+
+### Double DQN vs Naive DQN
+
+Naive DQN 的过估计问题：
+```
+Q(s,a) = r + γ * max_a' Q_target(s', a')
+```
+如果 Q_target 对所有动作都过估计，会导致次优策略被高估。
+
+Double DQN 缓解：
+```
+a* = argmax_a' Q_main(s', a')
+Q(s,a) = r + γ * Q_target(s', a*)
 ```
 
-### 评估已有模型
+### ε-贪婪策略
 
-```bash
-python eval_framework.py --load-latest
+线性衰减公式：
+```python
+epsilon = max(epsilon_end, epsilon_start - step / epsilon_decay)
 ```
 
-### 继续训练
+对于 Acrobot：
+- 前期（ε=1.0）：随机动作，充分探索状态空间
+- 后期（ε=0.01）：几乎贪婪，利用已学策略
 
-```bash
-python eval_framework.py --continue-train --steps 4000000
-```
+---
 
-## 文件结构
+## ✅ 结项确认
 
-```
-acrobot_ppo/
-├── eval_framework.py     # 主训练脚本（当前分支）
-├── CHECKPOINT.md         # Checkpoint 管理文档
-├── reward_shaping.py     # Reward shaping 实验
-└── train_shaped.py       # Shaped reward 训练
-```
+- [x] Double DQN 实现完成
+- [x] 达到 60 steps 强 Baseline 水平
+- [x] 多 seed 验证结果稳定
+- [x] 项目文档整理完成
+- [x] GitHub 仓库同步
 
-## 超参调优建议
+---
 
-如果默认配置没有提升，可以尝试：
-
-1. **降低 actor lr**：保持 actor 稳定性
-   ```bash
-   --lr 1e-4
-   ```
-
-2. **进一步提高 critic lr**：让 critic 更快学习
-   ```bash
-   --critic-lr 5e-3
-   ```
-
-3. **增加 critic hidden**：更大的表示空间
-   ```bash
-   --critic-hidden 1024
-   ```
-
-4. **增加 critic n_epochs**：更多的 critic 更新
-   ```bash
-   --critic-n-epochs 8
-   ```
+_项目完成日期：2026-04-07_
