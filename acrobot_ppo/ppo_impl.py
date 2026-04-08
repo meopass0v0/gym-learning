@@ -1,17 +1,16 @@
 """
-PPO Core Implementation - 手写版（修正版）
+PPO Core Implementation - 手写版（完整优化版）
 
-核心链条:
+包含:
 1. actor-critic 网络
-2. rollout 收集（修复: episode 结束后必须 reset）
-3. return 计算
-4. advantage / GAE（修复: bootstrap 用 next_value）
-5. PPO clipped objective
-6. value loss
-7. entropy bonus
-8. minibatch 更新
-9. old log prob 缓存
-10. 简单训练循环
+2. rollout 收集（episode 结束后必须 reset）
+3. return 计算 + GAE
+4. PPO clipped objective
+5. Value clipping（与 policy clip 对称）
+6. KL early stopping
+7. Entropy bonus
+8. Minibatch 更新
+9. LR / Clip decay
 """
 
 import gymnasium as gym
@@ -46,13 +45,10 @@ class ActorCritic(nn.Module):
         features = self.net(x)
         return self.actor(features), self.critic(features)
 
-    def get_action(self, obs, deterministic=False):
+    def get_action(self, obs):
         action_logits, value = self.forward(obs)
         dist = Categorical(logits=action_logits)
-        if deterministic:
-            action = torch.argmax(action_logits, dim=-1)
-        else:
-            action = dist.sample()
+        action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), value.squeeze(-1)
 
     def get_action_and_logprob(self, obs, action):
@@ -62,15 +58,9 @@ class ActorCritic(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# 2. Rollout 收集（修复: episode 结束后必须 reset）
+# 2. Rollout 收集
 # ─────────────────────────────────────────────
 def collect_rollout(env, model, n_steps):
-    """
-    收集 n_steps 步数据。
-
-    关键: episode 结束后必须 env.reset()，否则后续数据全在 terminal state
-    上踩出来的无效轨迹。
-    """
     obs_buffer, act_buffer, rew_buffer = [], [], []
     done_buffer, logp_buffer, val_buffer = [], [], []
     ent_buffer = []
@@ -84,7 +74,6 @@ def collect_rollout(env, model, n_steps):
 
         obs_np, reward, done, truncated, _ = env.step(action.item())
 
-        # ✅ 关键修复: episode 结束后必须 reset
         if done or truncated:
             obs_new, _ = env.reset()
             obs_new = torch.tensor(obs_new, dtype=torch.float32, device=DEVICE)
@@ -109,64 +98,49 @@ def collect_rollout(env, model, n_steps):
 
 
 # ─────────────────────────────────────────────
-# 3 & 4. Return 计算 + GAE（修复: bootstrap 用 next_value）
+# 3 & 4. GAE
 # ─────────────────────────────────────────────
 def compute_returns_and_advantages(val_buf, rew_buf, done_buf, gamma, lam):
-    """
-    GAE (Generalized Advantage Estimation)
-
-    核心公式（从后向前递推）：
-        δ_t = r_t + γ * V(s_{t+1}) * mask - V(s_t)       # TD residual
-        A_t = δ_t + γ * λ * mask * A_{t+1}               # GAE 递推
-
-    其中：
-        λ=0 -> 纯 TD(1)，低方差高偏差
-        λ=1 -> 纯 Monte Carlo，无偏差高方差
-        常用 λ=0.95 做平衡
-
-    注意：
-        - A_t 累积的是 previous gae，不是 next_value
-        - mask=0 时（episode 结束），GAE 退化为 δ_t = r_t - V(s_t)
-        - bootstrap: 最后一个 timestep 用 val_buf[-1]
-    """
     n = len(rew_buf)
     advantages = torch.zeros(n, device=DEVICE)
 
-    next_value = val_buf[-1].item()   # bootstrap: 用最后一个状态的 value
-    next_gae = 0.0                     # 最末时刻的 gae 初始化为 0
+    next_value = val_buf[-1].item()
+    next_gae = 0.0
 
     for t in reversed(range(n)):
-        mask = 1.0 - done_buf[t].float()   # 0 if done else 1
-        # TD residual: critic 的"意外程度"
+        mask = 1.0 - done_buf[t].float()
         delta = rew_buf[t] + gamma * next_value * mask - val_buf[t]
-        # ✅ 正确递推：累积的是 gae，不是 next_value
-        # A_t = δ_t + γλmask * A_{t+1}
         next_gae = delta + gamma * lam * mask * next_gae
         advantages[t] = next_gae
-        # 更新 next_value：当前状态的价值向前传播
         next_value = val_buf[t].item()
 
-    # 标准化只给 actor 用，不污染 critic target
     raw_advantages = advantages.clone()
     advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-8)
-    returns = raw_advantages + val_buf  # 用未标准化的原始 advantage 给 critic
+    returns = raw_advantages + val_buf
     return returns, advantages
 
 
 # ─────────────────────────────────────────────
-# 5, 6, 7. PPO Loss
+# 5, 6, 7. PPO Loss (with Value Clipping)
 # ─────────────────────────────────────────────
-def ppo_loss(model, obs_b, act_b, old_logp_b, returns_b, advantages_b,
+def ppo_loss(model, obs_b, act_b, old_logp_b, old_v_b, returns_b, advantages_b,
              logp_new_b, ent_b, clip_range, value_coef, ent_coef):
+    # Policy loss (PPO clipped objective)
     ratio = torch.exp(logp_new_b - old_logp_b)
     surr1 = ratio * advantages_b
     ratio_clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
     surr2 = ratio_clipped * advantages_b
     policy_loss = -torch.min(surr1, surr2).mean()
 
+    # Value loss with clipping (symmetric with policy clip)
     values_new = model.critic(model.net(obs_b)).squeeze(-1)
-    value_loss = nn.functional.mse_loss(values_new, returns_b)
+    v_clipped = old_v_b + torch.clamp(values_new - old_v_b, -clip_range, clip_range)
+    value_loss = torch.max(
+        (values_new - returns_b) ** 2,
+        (v_clipped - returns_b) ** 2
+    ).mean()
 
+    # Entropy loss
     entropy_loss = -ent_b.mean()
 
     return (policy_loss + value_coef * value_loss + ent_coef * entropy_loss,
@@ -174,34 +148,54 @@ def ppo_loss(model, obs_b, act_b, old_logp_b, returns_b, advantages_b,
 
 
 # ─────────────────────────────────────────────
-# 8 & 9. Minibatch 更新
+# 8 & 9. Minibatch 更新 (with KL Early Stopping)
 # ─────────────────────────────────────────────
-def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, returns_b, advantages_b,
-               clip_range, value_coef, ent_coef, batch_size, n_epochs):
+def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, old_v_b,
+               returns_b, advantages_b, clip_range, value_coef, ent_coef,
+               batch_size, n_epochs, target_kl=None):
     n = obs_b.shape[0]
-    for _ in range(n_epochs):
+
+    for epoch in range(n_epochs):
         idx = torch.randperm(n, device=DEVICE)
+        kl_sum = 0.0
+        num_batches = 0
+
         for start in range(0, n, batch_size):
             mb = idx[start:start + batch_size]
             logp_new, ent, _ = model.get_action_and_logprob(obs_b[mb], act_b[mb])
-            loss, _, _, _ = ppo_loss(model, obs_b[mb], act_b[mb], old_logp_b[mb],
-                                      returns_b[mb], advantages_b[mb],
-                                      logp_new, ent, clip_range, value_coef, ent_coef)
+
+            loss, p_loss, v_loss, ent_loss = ppo_loss(
+                model, obs_b[mb], act_b[mb], old_logp_b[mb], old_v_b[mb],
+                returns_b[mb], advantages_b[mb],
+                logp_new, ent, clip_range, value_coef, ent_coef)
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
 
+            kl_sum += (logp_new - old_logp_b[mb]).mean().item()
+            num_batches += 1
+
+        # KL early stopping
+        avg_kl = kl_sum / num_batches if num_batches > 0 else 0.0
+        if target_kl is not None and avg_kl > target_kl:
+            return p_loss.item(), v_loss.item(), ent_loss.item(), avg_kl, epoch + 1
+
+    return p_loss.item(), v_loss.item(), ent_loss.item(), avg_kl, n_epochs
+
 
 # ─────────────────────────────────────────────
-# 10. 训练循环 + Honest Metrics
+# 线性衰减
+# ─────────────────────────────────────────────
+def linear_decay(initial, final, progress):
+    return initial - (initial - final) * progress
+
+
+# ─────────────────────────────────────────────
+# 评估
 # ─────────────────────────────────────────────
 def compute_goal_success(env, model, n_episodes=20):
-    """
-    诚实评估: 用环境的真实终止条件判断成功
-    Acrobot: done=True (terminated) = 到达目标
-             truncated=True          = 超过步数上限，非成功
-    """
     model.eval()
     rewards, lengths, true_successes = [], [], []
 
@@ -222,16 +216,21 @@ def compute_goal_success(env, model, n_episodes=20):
 
         rewards.append(total_r)
         lengths.append(steps)
-        # ✅ 关键: done 且 not truncated 才算真正到达目标
         true_successes.append(done and not truncated)
 
+    model.train()
     sr = np.mean(true_successes) * 100
     return np.mean(rewards), np.mean(lengths), sr, true_successes
 
 
+# ─────────────────────────────────────────────
+# 训练
+# ─────────────────────────────────────────────
 def train(env_id, total_steps=100_000, n_steps=4096, batch_size=256,
           n_epochs=10, lr=3e-4, gamma=0.99, lam=0.95,
-          clip_range=0.2, value_coef=0.5, ent_coef=0.01,
+          clip_range_init=0.2, clip_range_final=0.1,
+          value_coef=0.5, ent_coef=0.01,
+          target_kl=0.015,
           eval_every=10, log_every=2):
     env = gym.make(env_id)
     obs_dim = env.observation_space.shape[0]
@@ -241,26 +240,36 @@ def train(env_id, total_steps=100_000, n_steps=4096, batch_size=256,
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     print("=" * 60)
-    print("PPO Core Implementation - 修正版")
+    print("PPO Core Implementation - 完整优化版")
     print(f"  env={env_id} | obs={obs_dim} | act={act_dim}")
     print(f"  n_steps={n_steps} | batch={batch_size} | epochs={n_epochs}")
-    print(f"  lr={lr} | gamma={gamma} | lam={lam} | clip={clip_range}")
+    print(f"  lr={lr} | gamma={gamma} | lam={lam}")
+    print(f"  clip: {clip_range_init} -> {clip_range_final}")
+    print(f"  value_clip + kl_early_stop + lr/clip_decay")
     print(f"  device={DEVICE}")
     print("=" * 60)
 
     total_updates = total_steps // n_steps
     history = {"update": [], "train_reward": [], "train_length": [],
-                "eval_reward": [], "eval_length": [], "eval_sr": []}
+               "eval_reward": [], "eval_length": [], "eval_sr": [],
+               "policy_loss": [], "value_loss": [], "entropy": [], "kl": []}
 
     for it in range(1, total_updates + 1):
-        # ── Rollout ──
+        progress = (it - 1) / max(total_updates - 1, 1)
+
+        # Decay
+        current_lr = linear_decay(lr, lr * 0.1, progress)
+        current_clip = linear_decay(clip_range_init, clip_range_final, progress)
+        for pg in optimizer.param_groups:
+            pg["lr"] = current_lr
+
+        # Rollout
         obs_b, act_b, rew_b, done_b, logp_b, val_b, ent_b = collect_rollout(env, model, n_steps)
 
-        # ── GAE ──
+        # GAE
         returns_b, advantages_b = compute_returns_and_advantages(val_b, rew_b, done_b, gamma, lam)
 
-        # ── Train Metrics（诚实统计）─
-        # 切分真实的 episode：累积 reward/length，done 时才算一个 episode 结束
+        # Train Metrics
         ep_rewards, ep_lengths = [], []
         ep_r, ep_l = 0.0, 0
         for i in range(n_steps):
@@ -273,22 +282,29 @@ def train(env_id, total_steps=100_000, n_steps=4096, batch_size=256,
 
         avg_train_r = np.mean(ep_rewards) if ep_rewards else 0.0
         avg_train_l = np.mean(ep_lengths) if ep_lengths else 0.0
-        train_sr = np.mean([r > -100 for r in ep_rewards]) * 100 if ep_rewards else 0.0
 
-        # ── Update ──
-        ppo_update(model, optimizer, obs_b, act_b, logp_b, returns_b, advantages_b,
-                   clip_range, value_coef, ent_coef, batch_size, n_epochs)
+        # Update
+        p_loss, v_loss, entropy, kl, _ = ppo_update(
+            model, optimizer, obs_b, act_b, logp_b, val_b,
+            returns_b, advantages_b,
+            current_clip, value_coef, ent_coef,
+            batch_size, n_epochs, target_kl)
 
-        # ── Log ──
+        # Log
         if it % log_every == 0:
             print(f"[U{it:3d}/{total_updates}] "
                   f"train_R={avg_train_r:7.2f} | train_L={avg_train_l:6.1f} | "
-                  f"train_SR={train_sr:5.1f}%")
+                  f"p_loss={p_loss:.4f} | v_loss={v_loss:.4f} | "
+                  f"ent={entropy:.4f} | kl={kl:.4f}")
 
-        # ── Honest Eval ──
+        # Eval
         if it % eval_every == 0 or it == total_updates:
             eval_r, eval_l, eval_sr, _ = compute_goal_success(env, model, n_episodes=20)
             history["update"].append(it)
+            history["policy_loss"].append(p_loss)
+            history["value_loss"].append(v_loss)
+            history["entropy"].append(entropy)
+            history["kl"].append(kl)
             history["eval_reward"].append(eval_r)
             history["eval_length"].append(eval_l)
             history["eval_sr"].append(eval_sr)
@@ -302,29 +318,32 @@ def train(env_id, total_steps=100_000, n_steps=4096, batch_size=256,
 # ─────────────────────────────────────────────
 def plot(history, save_dir):
     updates = history["update"]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle("PPO Training - Honest Metrics", fontsize=14, fontweight="bold")
+    if not updates:
+        return
 
-    axes[0].plot(updates, history["eval_reward"], "b-", linewidth=2)
-    axes[0].set_xlabel("Update"); axes[0].set_ylabel("Avg Reward")
-    axes[0].set_title("Average Episode Reward (Higher = Better)")
-    axes[0].grid(alpha=0.3)
-    axes[0].axhline(y=-100, color="red", linestyle="--", label="success threshold")
-    axes[0].legend()
+    rows, cols = 2, 3
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 8))
+    fig.suptitle("PPO Training - Acrobot", fontsize=14, fontweight="bold")
 
-    axes[1].plot(updates, history["eval_length"], "orange", linewidth=2)
-    axes[1].set_xlabel("Update"); axes[1].set_ylabel("Avg Length")
-    axes[1].set_title("Average Episode Length (Lower = Faster)")
-    axes[1].grid(alpha=0.3)
+    def subplot(ax, y, title, ylabel, color, hline=None):
+        ax.plot(updates, y, color=color, linewidth=1.5)
+        ax.set_title(title)
+        ax.set_xlabel("Update")
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.3)
+        if hline:
+            ax.axhline(y=hline, color="green", linestyle="--", alpha=0.7)
 
-    axes[2].plot(updates, history["eval_sr"], "g-", linewidth=2)
-    axes[2].set_xlabel("Update"); axes[2].set_ylabel("Success Rate (%)")
-    axes[2].set_title("Goal Success Rate (Higher = Better)")
-    axes[2].set_ylim(0, 105); axes[2].grid(alpha=0.3)
+    subplot(axes[0, 0], history["eval_reward"], "Avg Reward", "Reward", "blue")
+    subplot(axes[0, 1], history["eval_length"], "Avg Length", "Length", "orange")
+    subplot(axes[0, 2], history["eval_sr"], "Success Rate (%)", "SR", "green", 100)
+    subplot(axes[1, 0], history["policy_loss"], "Policy Loss", "Loss", "red")
+    subplot(axes[1, 1], history["value_loss"], "Value Loss", "Loss", "purple")
+    subplot(axes[1, 2], history["kl"], "KL Divergence", "KL", "brown")
 
     plt.tight_layout()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(save_dir, f"ppo_honest_{ts}.png")
+    path = os.path.join(save_dir, f"ppo_full_{ts}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     print(f"\n[Saved] {path}")
     plt.close()
@@ -345,11 +364,13 @@ if __name__ == "__main__":
         total_steps=args.steps,
         n_steps=4096, batch_size=256, n_epochs=10,
         lr=3e-4, gamma=0.99, lam=0.95,
-        clip_range=0.2, value_coef=0.5, ent_coef=0.01,
+        clip_range_init=0.2, clip_range_final=0.1,
+        value_coef=0.5, ent_coef=0.01,
+        target_kl=0.015,
         eval_every=5, log_every=2
     )
 
-    # 最终诚实评估
+    # 最终评估
     env = gym.make("Acrobot-v1")
     final_r, final_l, final_sr, successes = compute_goal_success(env, model, n_episodes=50)
     print("\n" + "=" * 60)
@@ -361,5 +382,5 @@ if __name__ == "__main__":
     plot(history, save_dir)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    torch.save(model.state_dict(), os.path.join(save_dir, f"ppo_from_scratch_{ts}.pt"))
-    print(f"\n[Saved] ppo_from_scratch_{ts}.pt")
+    torch.save(model.state_dict(), os.path.join(save_dir, f"ppo_full_{ts}.pt"))
+    print(f"\n[Saved] ppo_full_{ts}.pt")
